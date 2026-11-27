@@ -6,7 +6,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import benchmark_comfyui as benchmark
 
@@ -553,6 +553,149 @@ class ModelPhaseDockerTests(unittest.TestCase):
         self.assertEqual(after["model_phases"]["missing_measured_sequences"], [4])
         self.assertEqual(after["model_phases"]["measured_records"], 3)
         self.assertEqual(after["measured"]["status_counts"], {"success": 4})
+
+
+class FakePodComfyUI(FakeComfyUI):
+    """模拟 Pod 自己创建的进程和回环 API，并记录启动与清理顺序。"""
+
+    gpu_uuid = FakeDockerComfyUI.gpu_uuid
+    port = 21000
+
+    def __init__(self, fail_start=None):
+        super().__init__()
+        self.fail_start = fail_start
+        self.launches = []
+        self.stopped = []
+        self.process = None
+        self.probe_bytes = []
+
+    def command(self, command, timeout=30):
+        """模拟物理卡信息、独占检查和原生模块预检。"""
+        if command[0] == "nvidia-smi":
+            if "--query-compute-apps=pid" in command:
+                assert self.process is None
+                assert f"--id={self.gpu_uuid}" in command
+                return ""
+            assert "--id=2" in command
+            return f"{self.gpu_uuid}, NVIDIA Test GPU, 32768, 595.58"
+        assert command[1:] == ["-c", "from comfyui_rs._native import PromptScheduler"]
+        return ""
+
+    def launch(self, command, *, cwd, env, start_new_session, **_options):
+        """模拟新 worker 及其临时探针，前一个必须已完成清理。"""
+        assert self.process is None and start_new_session
+        index = len(self.launches) + 1
+        self.process = SimpleNamespace(pid=1000 + index, poll=Mock(return_value=None), wait=Mock(return_value=0))
+        self.launches.append((command, cwd, env))
+        self.payloads[f"http://worker-{index}.test"] = []
+        if path := env.get("COMFYUI_RS_MODEL_PHASE_PATH"):
+            probe = Path(path).parent / "probe_nodes" / benchmark.phase_report.PROBE_FILENAME
+            self.probe_bytes.append(probe.read_bytes())
+            Path(path).write_text(FakeModelPhaseDocker.marker + "\n", encoding="utf-8")
+        return self.process
+
+    def stop(self, pid, signum):
+        """核对只向当前测试子进程组发送结束信号。"""
+        assert self.process.pid == pid
+        assert signum == benchmark.signal.SIGTERM
+        self.stopped.append(pid)
+        self.process = None
+
+    def request(self, base_url, route, timeout, payload=None):
+        """返回当前进程的设备和工作流结果，并模拟本地阶段记录。"""
+        assert self.process is not None and base_url == f"http://127.0.0.1:{self.port}"
+        index = len(self.launches)
+        command, _cwd, env = self.launches[-1]
+        if route == "/system_stats":
+            kind = "cpu" if self.fail_start == index else "cuda"
+            return {"system": {"argv": command, "comfyui_version": "test", "python_version": "test",
+                               "pytorch_version": "test"}, "devices": [{"type": kind}]}
+        result = super().request(f"http://worker-{index}.test", route, timeout, payload)
+        path = env.get("COMFYUI_RS_MODEL_PHASE_PATH")
+        if path is not None and route == "/prompt" and payload is not None:
+            with Path(path).open("a", encoding="utf-8") as file:
+                file.write(json.dumps({
+                    "schema": 1, "prompt_id": result["prompt_id"], "workflow_host_ms": 5, "probe_errors": 0,
+                    "phases": {"model_load": {"calls": 1, "host_ms": 3}},
+                    "weight_move_cuda": {"stream_ms": None, "events_complete": 0, "events_incomplete": 0,
+                                         "events_dropped": 0, "events_failed": 0},
+                }) + "\n")
+        return result
+
+
+class PodNativeBenchmarkTests(unittest.TestCase):
+    def run_benchmark(self, fake, *extra_args):
+        """从 CLI 跑完整 Pod 路径，替换 GPU、进程和 HTTP。"""
+        with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
+            app = Path(directory).resolve()
+            (app / "comfyui").mkdir()
+            (app / "comfyui" / "main.py").touch()
+            first, second, output = [app / f"{name}.json" for name in ("a", "b", "report")]
+            first.write_text(json.dumps(workflow(11)), encoding="utf-8")
+            second.write_text(json.dumps(workflow(22, "RandomNoise", "noise_seed")), encoding="utf-8")
+            gpu = {"enabled": True, "device_uuid": fake.gpu_uuid, "sample_count": 3,
+                   "sample_error_count": 0, "baseline_mib": 1024, "peak_mib": 4096}
+            with (
+                patch.object(benchmark, "command_output", side_effect=fake.command),
+                patch.object(benchmark, "request_json", side_effect=fake.request),
+                patch.object(benchmark.subprocess, "Popen", side_effect=fake.launch),
+                patch.object(benchmark.os, "killpg", side_effect=fake.stop),
+                patch.object(benchmark.socket, "socket") as socket,
+                patch.object(benchmark, "GpuSampler") as sampler,
+            ):
+                socket.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", fake.port)
+                sampler.return_value.stop.return_value = gpu
+                code = benchmark.main([
+                    "--pod-native-compare", "--app-dir", str(app), "--gpu", "2", "--workflow", str(first),
+                    "--workflow", str(second), "--output", str(output), "--repeats", "2", *extra_args,
+                ])
+                selectors = [call.args[0] for call in sampler.call_args_list]
+            return code, json.loads(output.read_text(encoding="utf-8")), selectors
+
+    def test_default_rounds_reverse_order_and_reuse_workload_without_probe(self):
+        """无探针模式复用唯一 GPU、种子和工作流，两轮交换顺序。"""
+        fake = FakePodComfyUI()
+        code, report, selectors = self.run_benchmark(fake, "--no-phase-probe")
+        self.assertEqual(code, 0)
+        self.assertTrue(report["comparable"])
+        self.assertEqual([row["order"] for row in report["rounds"]], [["rust", "python"], ["python", "rust"]])
+        self.assertEqual([env["COMFYUI_RS_NATIVE_MODE"] for _, _, env in fake.launches], ["rust", "python", "python", "rust"])
+        self.assertEqual([env["CUDA_VISIBLE_DEVICES"] for _, _, env in fake.launches], [fake.gpu_uuid] * 4)
+        self.assertTrue(all("COMFYUI_RS_MODEL_PHASE_PATH" not in env for _, _, env in fake.launches))
+        self.assertEqual(selectors, [fake.gpu_uuid] * 4)
+        self.assertEqual(fake.stopped, [1001, 1002, 1003, 1004])
+        prompts = [rows for host, rows in fake.payloads.items() if host.startswith("http://worker-")]
+        self.assertEqual([len(rows) for rows in prompts], [6] * 4)
+        self.assertEqual(prompts[1:], prompts[:1] * 3)
+        self.assertNotIn("phase_metrics_complete", report["rounds"][0])
+        self.assertEqual(report["paired"]["gpu_peak_mib"]["pairs"], 2)
+
+    def test_default_probe_profiles_matching_measured_jobs(self):
+        """两组使用同一份探针文件，阶段统计排除预热。"""
+        fake = FakePodComfyUI()
+        code, report, _selectors = self.run_benchmark(fake, "--rounds", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.probe_bytes, [benchmark.MODEL_PHASE_PROBE.read_bytes()] * 2)
+        row = report["rounds"][0]
+        self.assertTrue(row["phase_metrics_complete"])
+        for result in row["variants"].values():
+            self.assertEqual(result["model_phases"]["measured_records"], 4)
+            self.assertEqual(result["model_phases"]["host_phases"]["model_load"]["median_host_ms"], 3)
+
+    def test_startup_failure_retains_partial_round_and_cleans_up(self):
+        """第二组设备准备失败时终止两个已启动进程，保留第一组。"""
+        fake = FakePodComfyUI(fail_start=2)
+        code, report, selectors = self.run_benchmark(fake, "--no-phase-probe")
+        self.assertEqual(code, 1)
+        self.assertFalse(report["complete"])
+        self.assertFalse(report["comparable"])
+        self.assertEqual(fake.stopped, [1001, 1002])
+        self.assertEqual(len(fake.launches), 2)
+        self.assertEqual(selectors, [fake.gpu_uuid])
+        self.assertIn("python", report["pod"]["error"])
+        self.assertEqual(len(report["rounds"]), 1)
+        self.assertEqual(list(report["rounds"][0]["variants"]), ["rust"])
+
 
 if __name__ == "__main__":
     unittest.main()

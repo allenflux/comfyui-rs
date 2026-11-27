@@ -58,6 +58,29 @@ docker run --rm --gpus all --entrypoint /app/.venv/bin/python comfyui-rs:cuda-am
 
 ## 原版与混合版压测
 
+### 在同一个 Pod 对比开启 Rust 和 Python 回退
+
+在有 `nvidia-smi` 的专用压测 Pod 内执行。脚本复用当前镜像的 `/app`、同一张 GPU 和同一套工作流，通过 `COMFYUI_RS_NATIVE_MODE` 切换模式。示例跑两轮，第一轮先 Rust 后 Python，第二轮反过来。每组启动一个新的测试进程，结束后由脚本清理。
+
+```sh
+cd /app
+python3 scripts/benchmark_comfyui.py \
+  --pod-native-compare --app-dir /app --data-dir /app --gpu 0 \
+  --workflow workloads/model-a-api.json --workflow workloads/model-b-api.json \
+  --rounds 2 --warmups 2 --repeats 30 --concurrency 1 --timeout 1800 \
+  --output /tmp/comfyui-pod-comparison.json
+```
+
+正式对照需要独占所选 GPU。如果已有 ComfyUI 占用这张卡，脚本默认等待它释放再开始。脚本只管理本次启动的测试进程。只能在共享卡上试跑时可显式加 `--allow-shared-gpu`，报告会标记为探索结果。当前镜像若已支持 `COMFYUI_RS_NATIVE_MODE`，可把新版 `benchmark_comfyui.py`、`model_phase_report.py` 和 `model_phase_probe.py` 放在同一个 Pod 可读目录，使用该目录里的脚本和 `--app-dir /app`。
+
+`--data-dir` 指向现有的模型、输入和自定义节点数据，`--gpu` 接收 Pod 内可见的 GPU 索引或 UUID。两组默认使用 `--cache-none`，可用 `--use-comfy-cache` 恢复 ComfyUI 的工作流缓存。用 `--comfy-arg=参数` 逐项传入两组共用的启动参数。
+
+- 测常驻表现时只传一个单模型工作流并加 `--use-comfy-cache`，让加载节点可命中缓存。用内置采样节点的不同种子确保每次仍会执行推理。
+- 测切换时传两个使用不同模型的工作流，保持 `--concurrency 1`，并在报告里核对模型切换次数。测显存压力时用生产中的高分辨率、大批次或视频输入，结合报告中的显存峰值、回收调用及 OOM 率判断是否触发压力。
+- 初次试跑可用 `--rounds 1 --repeats 2`。加 `--warmups 0` 会把新进程的首次工作流计入测量。
+
+指定 `--output` 时，每轮结束都会保存 JSON。报告按轮保留吞吐、端到端 P99、显存峰值、OOM 率、worker RAM 及分阶段耗时，并汇总配对差值。要在关闭阶段计时探针时复测速度，可加 `--no-phase-probe`。如需跨 Pod 保留报告，把 `--output` 指向已有持久卷上的可写路径。
+
 ### 改前、改后镜像的模型阶段对照
 
 在 GPU 宿主机上，用同一份 `Dockerfile.cuda` 和相同依赖构建两个镜像。已经有改前镜像时，先为它保留独立标签。下面用本次模型加载优化前的提交构建基线，再用当前项目构建改后镜像。
