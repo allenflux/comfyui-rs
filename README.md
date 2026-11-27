@@ -58,7 +58,66 @@ docker run --rm --gpus all --entrypoint /app/.venv/bin/python comfyui-rs:cuda-am
 
 ## 原版与混合版压测
 
-用两个版本启动同一 ComfyUI 提交、同一模型和节点依赖，统一 PyTorch、启动参数及缓存设置。在压测机上准备 `nvidia-smi`，让两个实例分别使用同型号的独占 GPU。脚本按顺序执行两边，输入使用 ComfyUI 导出的 API 格式 JSON，可以重复传入 `--workflow` 形成一套混合负载。
+### 改前、改后镜像的模型阶段对照
+
+在 GPU 宿主机上，用同一份 `Dockerfile.cuda` 和相同依赖构建两个镜像。已经有改前镜像时，先为它保留独立标签。下面用本次模型加载优化前的提交构建基线，再用当前项目构建改后镜像。
+
+```sh
+before_source="$(mktemp -d /tmp/comfyui-rs-before.XXXXXX)"
+git worktree add --detach "$before_source" f7f0040c1227225d8dc181ec643865de213407c0
+docker build --platform linux/amd64 -f "$before_source/Dockerfile.cuda" \
+  -t comfyui-rs:cuda-before "$before_source"
+docker build --platform linux/amd64 -f Dockerfile.cuda -t comfyui-rs:cuda-after .
+```
+
+选用不同模型的两份 API 格式工作流，让同一张 GPU 依次执行 A、B。模型的合计驻留显存接近或超过显卡容量时，更容易观察到回收和重新加载。`--gpu` 支持宿主机 GPU 索引或 UUID。测 H200 时选对应的卡，并把输出文件改为 `model-phases-h200.json`。
+
+```sh
+python3 scripts/benchmark_comfyui.py \
+  --before-image comfyui-rs:cuda-before --after-image comfyui-rs:cuda-after \
+  --data-dir "$PWD" --gpu 0 \
+  --workflow workloads/model-a-api.json --workflow workloads/model-b-api.json \
+  --warmups 2 --repeats 50 --concurrency 1 --timeout 1800 \
+  --output model-phases-5090.json
+```
+
+脚本固定本地镜像 ID，在同一张卡上先跑改前，再清理容器并跑改后。两组复用同一份只读探针和数据挂载、工作流顺序、种子及启动参数。默认用 `--cache-none`，生产环境使用缓存时可加 `--use-comfy-cache`。需要部署专用参数时用 `--comfy-arg` 逐项传入。
+
+报告对成功的测量任务统计模型读取与加载、模型切换、权重搬运和显存回收的调用次数、中位数及 P99。主机侧计时包含子调用，阶段间可能重叠。切换次数按相邻模型管理请求的模型身份集合变化计数，也包含单个工作流内部的切换。CUDA 事件只覆盖探针能跟踪的搬运，按各流事件区间累计，多个流的事件区间可以重叠。报告同时保留采集覆盖情况、吞吐、端到端 P99、显存峰值和 OOM 率。RTX 5090 和 H200 的 CUDA 实测待在对应主机完成。
+
+### 一张 GPU 跑三组对照
+
+在安装了 Docker、NVIDIA Container Toolkit 和 `nvidia-smi` 的 Linux 宿主机上构建 CUDA 镜像。用下面的命令从现有 ComfyUI 仓库准备一份固定提交的原版源码。独立工作树可以避开原有目录中的本地代码改动和 `extra_model_paths.yaml`。
+
+```sh
+git -C /path/to/ComfyUI worktree add --detach /path/to/ComfyUI-benchmark \
+  7c78b5641ab2d6cb7f7766a183a8a43a59de0a8b
+```
+
+将真实工作流从 ComfyUI 导出为 API 格式 JSON。下例依次提交 A、B 两个工作流。测试换模时，选用不同的模型，并让两个模型的常驻显存需求合计接近或超过 GPU 的可用显存。测试显存压力时，使用生产中的高分辨率、长视频或大批次输入。
+
+```sh
+python3 scripts/benchmark_comfyui.py \
+  --docker-image comfyui-rs:cuda-amd64 \
+  --original-source /path/to/ComfyUI-benchmark --data-dir "$PWD" --gpu 0 \
+  --workflow workloads/model-a-api.json --workflow workloads/model-b-api.json \
+  --warmups 2 --repeats 50 --concurrency 1 --timeout 1800 \
+  --output benchmark-5090.json
+```
+
+脚本在选定的 GPU 上依次运行原版、混合版开启 Rust、混合版关闭 Rust。每组结束后移除容器，再启动下一组。三组使用同一个镜像及其中的 Python 和 PyTorch。`--gpu` 可填 `nvidia-smi` 显示的索引或 `GPU-...` UUID。跑 H200 时可使用同一条命令，指定对应设备及报告路径。压测期间让脚本独占该 GPU。
+
+三组以只读方式共享 `--data-dir` 下已有的 `models/`、`input/`、`custom_nodes/` 和 `extra_model_paths.yaml`，输出、临时文件和用户状态写入各自容器。模型路径配置引用的路径需要在容器内可访问。自定义节点的 Python 依赖需提前装进同一个测试镜像。
+
+`--concurrency 1` 保持交替提交顺序。Docker 模式默认用 `--cache-none` 让每次提交完整执行，并关闭资产系统。用 `--use-comfy-cache` 可以沿用 ComfyUI 的默认缓存。生产启动参数可用 `--comfy-arg` 逐个传给三组，例如 `--comfy-arg=--reserve-vram --comfy-arg=4`。慢启动可提高 `--startup-timeout`，单位为秒，默认 120。
+
+吞吐按成功任务数除以测量阶段用时计算。P99 统计成功任务从提交到查询到结果的耗时。显存峰值取 `nvidia-smi` 对同一张整卡在测量阶段的采样最大值。OOM 率以已知执行终态为分母，拒绝、超时和结果未知分别计数。报告也记录 `worker_peak_rss_mib`，取 ComfyUI 主进程从启动到测量结束的常驻 RAM 峰值，包含预热。测 RAM 缓存回收时加 `--use-comfy-cache`，三组沿用相同的缓存配置。
+
+三组复用相同的任务顺序和种子规则，预热单独统计。脚本默认变更内置采样节点的整数种子，`--keep-seeds` 可保留原值。
+
+### 自行启动实例做双组对照
+
+使用相同 ComfyUI 提交、模型、节点依赖、PyTorch、启动参数和缓存设置。在压测机上准备 `nvidia-smi`，让两个实例分别使用同型号的独占 GPU。脚本按顺序执行两组，`--no-gpu-metrics` 可用于 CPU 验证，报告中的显存值为空。
 
 ```sh
 python3 scripts/benchmark_comfyui.py \
@@ -68,11 +127,7 @@ python3 scripts/benchmark_comfyui.py \
   --warmups 2 --repeats 50 --concurrency 2 --output benchmark.json
 ```
 
-压测复用工作流顺序、运行次数和种子变化规则，预热结果单独统计。吞吐按成功任务数除以测量阶段用时计算，P99 统计成功任务从提交到查询到结果的耗时。显存峰值是 `nvidia-smi` 定时采样的整卡占用最大值。OOM 率只统计可判定的执行结果，提交拒绝、超时和结果未知单独列出。`--no-gpu-metrics` 可用于 CPU 验证，报告中的显存值为空。
-
-工作流执行顺序会影响模型切换时，可用 `--concurrency 1` 固定提交顺序。脚本默认修改内置采样节点的整数字段种子，`--keep-seeds` 可保留原值。需要让固定输入的工作流每次完整执行时，两端可使用相同的 `--cache-none`。
-
-只有一张卡时，每次只运行一个实例，先采集原版，再停掉原版并启动混合版。分别传 `--original-url` 或 `--hybrid-url`，其余压测参数保持相同，然后合并两个报告。可以用这个方法分别测 5090 和 H200。
+手动复用同一张卡时，每次启动一个实例。分别传 `--original-url` 或 `--hybrid-url`，其余压测参数保持相同，再合并两个报告。需要每次完整执行时，两端使用相同的 `--cache-none`。
 
 ```sh
 python3 scripts/benchmark_comfyui.py --original-url http://127.0.0.1:8188 \

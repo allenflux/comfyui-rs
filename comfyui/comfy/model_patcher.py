@@ -1024,14 +1024,26 @@ class ModelPatcher:
             self.unpin_weight(key)
 
     def _load_list(self, for_dynamic=False, default_device=None):
+        """构建模块加载列表，普通叶子模块直接复用非递归参数枚举。"""
         loading = []
+        torch_module = torch.nn.Module
         for n, m in self.model.named_modules():
+            named_parameters = m.named_parameters
+            params = dict(named_parameters(recurse=False))
+            children = getattr(m, "_modules", None)
+            # 自定义枚举可能返回注册表以外的参数，保留原来的递归检查。
+            stock_leaf = (
+                type(children) is dict and not children
+                and getattr(named_parameters, "__func__", None) is torch_module.named_parameters
+                and getattr(m.named_modules, "__func__", None) is torch_module.named_modules
+                and getattr(m._named_members, "__func__", None) is torch_module._named_members
+            )
             default = False
-            params = { name: param for name, param in m.named_parameters(recurse=False) }
-            for name, param in m.named_parameters(recurse=True):
-                if name not in params:
-                    default = True # default random weights in non leaf modules
-                    break
+            if not stock_leaf:
+                for name, param in named_parameters(recurse=True):
+                    if name not in params:
+                        default = True # default random weights in non leaf modules
+                        break
             if default and default_device is not None:
                 for param_name, param in params.items():
                     param.data = param.data.to(device=default_device, dtype=getattr(m, param_name + "_comfy_model_dtype", None))
@@ -1075,20 +1087,21 @@ class ModelPatcher:
             offload_buffer = 0
             loading.sort(reverse=True)
             stream_count = comfy.model_management.NUM_STREAMS
-            offload_windows = _prepare_offload_windows(loading, stream_count)
+            offload_windows = None if full_load else _prepare_offload_windows(loading, stream_count)
             for i, x in enumerate(loading):
                 module_offload_mem, module_mem, n, m, params = x
 
                 lowvram_weight = False
-
-                current_stream_count = comfy.model_management.NUM_STREAMS
-                # 预取窗口可提前计算，已占用的卸载缓冲区仍随每个模块实时更新。
-                if offload_windows is not None and type(current_stream_count) is int and current_stream_count == stream_count:
-                    offload_needed = offload_windows[i]
-                else:
-                    offload_needed = module_offload_mem + sum([x1[1] for x1 in loading[i+1:i+1+current_stream_count]])
-                potential_offload = max(offload_buffer, offload_needed)
-                lowvram_fits = mem_counter + module_mem + potential_offload < lowvram_model_memory
+                lowvram_fits = True
+                if not full_load:
+                    current_stream_count = comfy.model_management.NUM_STREAMS
+                    # 只有部分加载才使用预取窗口和显存预算，卸载缓冲区按实际进度更新。
+                    if offload_windows is not None and type(current_stream_count) is int and current_stream_count == stream_count:
+                        offload_needed = offload_windows[i]
+                    else:
+                        offload_needed = module_offload_mem + sum([x1[1] for x1 in loading[i+1:i+1+current_stream_count]])
+                    potential_offload = max(offload_buffer, offload_needed)
+                    lowvram_fits = mem_counter + module_mem + potential_offload < lowvram_model_memory
 
                 weight_key = "{}.weight".format(n)
                 bias_key = "{}.bias".format(n)
@@ -1166,7 +1179,8 @@ class ModelPatcher:
                 if comfy.model_management.is_device_cuda(device_to):
                     torch.cuda.synchronize()
 
-                logging.debug("lowvram: loaded module regularly {} {}".format(n, m))
+                # 日志关闭时无需为每层生成模块字符串。
+                logging.debug("lowvram: loaded module regularly %s %s", n, m)
                 m.comfy_patched_weights = True
 
             for x in load_completely:

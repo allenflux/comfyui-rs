@@ -73,6 +73,64 @@ class FakeComfyUI:
         raise AssertionError(f"Unexpected mocked request: {base_url} {route}")
 
 
+class FakeDockerComfyUI(FakeComfyUI):
+    """模拟宿主命令和单卡上的一个活动实例。"""
+
+    gpu_uuid = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+    image_id = "sha256:" + "a" * 64
+    variants = ("original", "hybrid_rust", "hybrid_python")
+    hosts = ("http://original.test", "http://hybrid.test", "http://hybrid-python.test")
+
+    def __init__(self, cpu_fallback=None):
+        """记录启动和清理事件，允许指定一组模拟 CPU 回退。"""
+        super().__init__()
+        self.payloads = {host: [] for host in self.hosts}
+        self.cpu_fallback = cpu_fallback
+        self.container = None
+        self.commands = []
+        self.launches = []
+        self.removed = []
+
+    def command(self, command, timeout=30):
+        """模拟 Docker 和 NVIDIA 查询，并检查容器从不重叠。"""
+        self.commands.append(command)
+        if command[0] == "nvidia-smi":
+            if "--query-compute-apps=pid" in command:
+                assert self.container is None
+                assert f"--id={self.gpu_uuid}" in command
+                return ""
+            return f"{self.gpu_uuid}, NVIDIA Test GPU, 32768, 595.58"
+        if command[:3] == ["docker", "image", "inspect"]:
+            return self.image_id
+        if command[:2] == ["docker", "run"]:
+            assert self.container is None
+            self.container = command[command.index("--name") + 1]
+            self.launches.append(command)
+            return self.container
+        if command[:2] == ["docker", "port"] and command[2] == self.container:
+            return f"127.0.0.1:{21000 + len(self.launches)}"
+        if command[:2] == ["docker", "exec"] and command[2] == self.container:
+            if command[3:] == ["cat", "/proc/1/status"]:
+                return f"Name:\tpython\nVmHWM:\t {len(self.launches) * 1048576} kB\nVmRSS:\t 1024 kB"
+            return ""
+        if command[:3] == ["docker", "rm", "--force"] and command[3] == self.container:
+            self.removed.append(self.container)
+            self.container = None
+            return ""
+        raise AssertionError(f"Unexpected mocked command: {command}")
+
+    def request(self, base_url, route, timeout, payload=None):
+        """从当前实例的端口返回设备、任务提交与历史。"""
+        assert self.container is not None
+        assert base_url == f"http://127.0.0.1:{21000 + len(self.launches)}"
+        index = len(self.launches) - 1
+        if route == "/system_stats":
+            device_type = "cpu" if self.variants[index] == self.cpu_fallback else "cuda"
+            return {"system": {"comfyui_version": "test", "python_version": "test",
+                               "pytorch_version": "test"}, "devices": [{"type": device_type}]}
+        return super().request(self.hosts[index], route, timeout, payload)
+
+
 class BenchmarkTests(unittest.TestCase):
     def test_workload_repeats_in_same_order_with_reproducible_seeds(self):
         """两侧复用同一计划，重复任务变更采样种子且不修改输入文件内容。"""
@@ -282,6 +340,219 @@ class BenchmarkTests(unittest.TestCase):
                 transport.assert_not_called()
                 sampler.assert_not_called()
 
+
+class DockerBenchmarkTests(unittest.TestCase):
+    def run_benchmark(self, fake):
+        """用两个工作流完整执行 CLI，拦截 Docker、HTTP 和显存采样。"""
+        with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
+            work = Path(directory).resolve()
+            original, data = work / "original", work / "data"
+            original.mkdir()
+            (original / "main.py").touch()
+            (data / "models").mkdir(parents=True)
+            (data / "extra_model_paths.yaml").write_text("{}", encoding="utf-8")
+            first, second, output = [work / f"{name}.json" for name in ("a", "b", "report")]
+            first.write_text(json.dumps(workflow(11)), encoding="utf-8")
+            second.write_text(json.dumps(workflow(22, "RandomNoise", "noise_seed")), encoding="utf-8")
+            gpu = {"enabled": True, "device_uuid": fake.gpu_uuid, "sample_count": 3,
+                   "sample_error_count": 0, "baseline_mib": 1024, "peak_mib": 4096}
+            with (
+                patch.object(benchmark, "command_output", side_effect=fake.command),
+                patch.object(benchmark, "request_json", side_effect=fake.request),
+                patch.object(benchmark, "GpuSampler") as sampler,
+            ):
+                sampler.return_value.stop.return_value = gpu
+                code = benchmark.main([
+                    "--docker-image", "test:cuda", "--original-source", str(original),
+                    "--data-dir", str(data), "--gpu", "2", "--workflow", str(first),
+                    "--workflow", str(second), "--output", str(output), "--repeats", "2",
+                    "--comfy-arg=--reserve-vram", "--comfy-arg=4",
+                ])
+                selectors = [call.args[0] for call in sampler.call_args_list]
+            return code, json.loads(output.read_text(encoding="utf-8")), selectors
+
+    def test_cli_runs_three_disjoint_containers_on_same_card_with_identical_prompts(self):
+        """原版和两种混合版复用工作负载，按顺序独占同一物理卡。"""
+        fake = FakeDockerComfyUI()
+        code, report, selectors = self.run_benchmark(fake)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["comparable"])
+        self.assertNotIn("phase_metrics_complete", report)
+        for result in report["variants"].values():
+            self.assertNotIn("model_phases", result)
+            self.assertTrue(all("prompt_id" not in job for job in result["jobs"]))
+        self.assertEqual(tuple(report["variants"]), fake.variants)
+        self.assertEqual(selectors, [fake.gpu_uuid] * 3)
+        self.assertEqual(len(fake.launches), 3)
+        self.assertEqual(fake.removed, [command[command.index("--name") + 1] for command in fake.launches])
+        self.assertIsNone(fake.container)
+        self.assertEqual(report["variants"]["original"]["measured"]["oom_rate"], 0.25)
+        self.assertEqual([result["gpu"]["peak_mib"] for result in report["variants"].values()], [4096] * 3)
+        self.assertEqual([result["worker_peak_rss_mib"] for result in report["variants"].values()], [1024, 2048, 3072])
+        prompts = [[payload["prompt"] for payload in batch] for batch in fake.payloads.values()]
+        self.assertEqual([len(batch) for batch in prompts], [6] * 3)
+        self.assertEqual(prompts, [prompts[0]] * 3)
+        original, rust, python = fake.launches
+        self.assertIn("/benchmark/original/main.py", original)
+        self.assertIn("/app/extra_model_paths.yaml", original)
+        self.assertIn("COMFYUI_RS_NATIVE_MODE=rust", rust)
+        self.assertIn("COMFYUI_RS_NATIVE_MODE=python", python)
+        checks = [command for command in fake.commands if command[:2] == ["docker", "exec"] and command[3] == benchmark.DOCKER_PYTHON]
+        self.assertEqual([command[2] for command in checks], [rust[rust.index("--name") + 1]])
+        for command in fake.launches:
+            self.assertIn(fake.image_id, command)
+            self.assertIn(f"device={fake.gpu_uuid}", command)
+            self.assertIn(f"{report['docker']['data_dir']}/models:/app/models:ro", command)
+            self.assertIn("--cache-none", command)
+            self.assertEqual(command[-2:], ["--reserve-vram", "4"])
+
+    def test_cli_cleans_up_failed_start_and_writes_partial_report(self):
+        """设备配置失败后清理新容器，并保留已完成的原版测量。"""
+        fake = FakeDockerComfyUI(cpu_fallback="hybrid_rust")
+        code, report, selectors = self.run_benchmark(fake)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["comparable"])
+        self.assertTrue(report["incomplete"])
+        self.assertEqual(tuple(report["variants"]), ("original",))
+        self.assertEqual(selectors, [fake.gpu_uuid])
+        self.assertEqual(len(fake.launches), 2)
+        self.assertEqual(fake.removed, [command[command.index("--name") + 1] for command in fake.launches])
+        self.assertIsNone(fake.container)
+        self.assertIn("hybrid_rust", report["docker"]["error"])
+
+
+class FakeModelPhaseDocker(FakeDockerComfyUI):
+    """模拟两份镜像各自的探针就绪记录、预热和测量任务。"""
+
+    variants = ("before", "after")
+    hosts = ("http://before.test", "http://after.test")
+    image_ids = {"bench:before": "sha256:" + "b" * 64, "bench:after": "sha256:" + "c" * 64}
+    marker = json.dumps({"schema": 1, "probe_ready": True})
+
+    def __init__(self, drop_record=None):
+        super().__init__()
+        self.drop_record = drop_record
+        self.ready_containers = set()
+
+    def command(self, command, timeout=30):
+        """在任务前读取就绪记录，在任务后以倒序回传探针记录。"""
+        if command[:3] == ["docker", "image", "inspect"]:
+            self.commands.append(command)
+            return self.image_ids[command[-1]]
+        if command[:2] == ["docker", "exec"] and command[-1] == benchmark.phase_report.PROBE_PATH:
+            self.commands.append(command)
+            assert command[2] == self.container
+            index = len(self.launches) - 1
+            if command[3:] == ["head", "-n", "1", benchmark.phase_report.PROBE_PATH]:
+                assert not self.payloads[self.hosts[index]]
+                self.ready_containers.add(self.container)
+                return self.marker
+            assert command[3:] == ["cat", benchmark.phase_report.PROBE_PATH]
+            lines = [self.marker]
+            for number in range(len(self.payloads[self.hosts[index]]), 0, -1):
+                if (self.variants[index], number) == self.drop_record:
+                    continue
+                host_ms = 999 if number <= 2 else index * 10 + number
+                lines.append(json.dumps({
+                    "schema": 1, "prompt_id": f"server-{self.variants[index]}-{number}",
+                    "workflow_host_ms": host_ms + 1, "probe_errors": 0,
+                    "phases": {"model_load": {"calls": 2, "host_ms": host_ms}},
+                    "weight_move_cuda": {"stream_ms": host_ms,
+                                         "events_complete": 1, "events_incomplete": 0,
+                                         "events_dropped": 0, "events_failed": 0},
+                }))
+            return "\n".join(lines)
+        return super().command(command, timeout)
+
+    def request(self, base_url, route, timeout, payload=None):
+        """模拟镜像返回独立的任务 ID，探针就绪后才接受提交。"""
+        if route == "/prompt" and payload is not None:
+            assert self.container in self.ready_containers
+            index = len(self.launches) - 1
+            number = len(self.payloads[self.hosts[index]]) + 1
+            payload = {**payload, "prompt_id": f"server-{self.variants[index]}-{number}"}
+        return super().request(base_url, route, timeout, payload)
+
+
+class ModelPhaseDockerTests(unittest.TestCase):
+    def run_benchmark(self, fake):
+        """执行双镜像 CLI 并读取完整报告。"""
+        with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
+            data = Path(directory).resolve()
+            (data / "models").mkdir()
+            first, second, output = [data / f"{name}.json" for name in ("a", "b", "report")]
+            first.write_text(json.dumps(workflow(11)), encoding="utf-8")
+            second.write_text(json.dumps(workflow(22, "RandomNoise", "noise_seed")), encoding="utf-8")
+            probe = data / "probe.py"
+            probe.write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+            gpu = {"enabled": True, "device_uuid": fake.gpu_uuid, "sample_count": 3,
+                   "sample_error_count": 0, "baseline_mib": 1024, "peak_mib": 4096}
+            with (
+                patch.object(benchmark, "command_output", side_effect=fake.command),
+                patch.object(benchmark, "request_json", side_effect=fake.request),
+                patch.object(benchmark, "MODEL_PHASE_PROBE", probe),
+                patch.object(benchmark, "GpuSampler") as sampler,
+            ):
+                sampler.return_value.stop.return_value = gpu
+                code = benchmark.main([
+                    "--before-image", "bench:before", "--after-image", "bench:after",
+                    "--data-dir", str(data), "--gpu", "2", "--workflow", str(first),
+                    "--workflow", str(second), "--output", str(output), "--repeats", "2",
+                    "--comfy-arg=--disable-all-custom-nodes", "--comfy-arg=--whitelist-custom-nodes=fixture.py",
+                ])
+                selectors = [call.args[0] for call in sampler.call_args_list]
+            return code, json.loads(output.read_text(encoding="utf-8")), selectors
+
+    def test_dual_images_profile_identical_workloads_on_same_gpu(self):
+        """同一张卡依次运行两份镜像，按任务匹配阶段，排除预热。"""
+        fake = FakeModelPhaseDocker()
+        code, report, selectors = self.run_benchmark(fake)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["comparable"])
+        self.assertTrue(report["phase_metrics_complete"])
+        self.assertEqual(tuple(report["variants"]), fake.variants)
+        self.assertEqual(selectors, [fake.gpu_uuid] * 2)
+        self.assertIsNone(fake.container)
+        self.assertEqual(fake.removed, [command[command.index("--name") + 1] for command in fake.launches])
+        prompts = [[payload["prompt"] for payload in batch] for batch in fake.payloads.values()]
+        self.assertEqual([len(batch) for batch in prompts], [6, 6])
+        self.assertEqual(prompts[0], prompts[1])
+        probe_target = f":/app/comfyui/custom_nodes/{benchmark.phase_report.PROBE_FILENAME}:ro"
+        mounts = [next(value for value in command if value.endswith(probe_target)) for command in fake.launches]
+        self.assertEqual(mounts[0], mounts[1])
+        self.assertFalse(Path(mounts[0].removesuffix(probe_target)).exists())
+        for index, (variant, command) in enumerate(zip(fake.variants, fake.launches)):
+            self.assertIn(fake.image_ids[f"bench:{variant}"], command)
+            self.assertIn(f"device={fake.gpu_uuid}", command)
+            self.assertIn(f"COMFYUI_RS_MODEL_PHASE_PATH={benchmark.phase_report.PROBE_PATH}", command)
+            whitelist = command.index("--whitelist-custom-nodes")
+            self.assertEqual(command[whitelist + 1:], [benchmark.phase_report.PROBE_FILENAME, "fixture.py"])
+            variant_data = report["variants"][variant]
+            phases = variant_data["model_phases"]
+            self.assertEqual(phases["measured_records"], 4)
+            self.assertEqual([row["sequence"] for row in phases["records"]], [3, 4, 5, 6])
+            self.assertEqual(phases["host_phases"]["model_load"], {
+                "jobs": 4, "calls": 8, "median_host_ms": 4.5 + 10 * index,
+                "p99_host_ms": 6 + 10 * index,
+            })
+            self.assertEqual(phases["weight_move_cuda"]["events_complete"], 4)
+            self.assertNotIn("prompt_id", variant_data["jobs"][0])
+            self.assertNotIn("prompt_id", phases["records"][0])
+
+    def test_missing_measurement_marks_phase_comparison_incomplete_and_cleans_up(self):
+        """测量任务缺失探针数据时，保留可用指标并返回失败。"""
+        fake = FakeModelPhaseDocker(drop_record=("after", 4))
+        code, report, _selectors = self.run_benchmark(fake)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["comparable"])
+        self.assertFalse(report["phase_metrics_complete"])
+        self.assertIsNone(fake.container)
+        self.assertEqual(len(fake.removed), 2)
+        before, after = report["variants"]["before"], report["variants"]["after"]
+        self.assertTrue(before["model_phases"]["complete"])
+        self.assertEqual(after["model_phases"]["missing_measured_sequences"], [4])
+        self.assertEqual(after["model_phases"]["measured_records"], 3)
+        self.assertEqual(after["measured"]["status_counts"], {"success": 4})
 
 if __name__ == "__main__":
     unittest.main()

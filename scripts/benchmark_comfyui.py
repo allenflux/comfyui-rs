@@ -1,4 +1,4 @@
-"""用同一组 API 工作流衡量原版和 Rust 混合版 ComfyUI。"""
+"""用同一组 API 工作流比较原版和 Rust 混合版 ComfyUI。"""
 
 import argparse
 import hashlib
@@ -6,6 +6,7 @@ import http.client
 import json
 import math
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -13,11 +14,19 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
+from uuid import uuid4
+
+if __package__:
+    from . import model_phase_report as phase_report
+else:
+    import model_phase_report as phase_report
 
 
 TERMINAL = {"success", "oom", "execution_error", "interrupted"}
@@ -30,6 +39,10 @@ SEED_FIELDS = {
     "SamplerCustom": "noise_seed",
     "RandomNoise": "noise_seed",
 }
+DOCKER_VARIANTS = ("original", "hybrid_rust", "hybrid_python")
+IMAGE_VARIANTS = ("before", "after")
+DOCKER_PYTHON = "/app/.venv/bin/python"
+MODEL_PHASE_PROBE = Path(__file__).with_name("model_phase_probe.py")
 
 
 @dataclass(frozen=True)
@@ -47,6 +60,7 @@ class JobResult:
     latency_seconds: float | None = None
     http_status: int | None = None
     poll_errors: int = 0
+    prompt_id: str | None = None
 
 
 class HttpStatusError(Exception):
@@ -158,10 +172,12 @@ def run_job(base_url, job, timeout, poll_interval):
     """从提交开始计时，只查询已接收任务的历史，不重发含糊的提交。"""
     started = time.perf_counter()
     deadline = started + timeout
+    prompt_id = None
 
     def finish(status, http_status=None, poll_errors=0):
-        """记录基准结果，丢弃服务端任务 ID 和正文。"""
-        return JobResult(job.workflow_index, job.sequence, status, time.perf_counter() - started, http_status, poll_errors)
+        """保留用于匹配探针的任务 ID，报告生成时丢弃该标识。"""
+        return JobResult(job.workflow_index, job.sequence, status, time.perf_counter() - started,
+                         http_status, poll_errors, prompt_id)
 
     try:
         accepted = request_json(base_url, "/prompt", timeout, {"prompt": job.prompt})
@@ -170,9 +186,10 @@ def run_job(base_url, job, timeout, poll_interval):
         return finish("rejected" if rejected else "submission_unknown", error.status)
     except TRANSPORT_ERRORS:
         return finish("submission_unknown")
-    prompt_id = accepted.get("prompt_id") if isinstance(accepted, dict) else None
-    if not isinstance(prompt_id, str) or not prompt_id:
+    accepted_id = accepted.get("prompt_id") if isinstance(accepted, dict) else None
+    if not isinstance(accepted_id, str) or not accepted_id:
         return finish("submission_unknown")
+    prompt_id = accepted_id
 
     route = "/history/" + quote(prompt_id, safe="")
     partial = bool(accepted.get("node_errors"))
@@ -295,7 +312,7 @@ class GpuSampler:
         }
 
 
-def benchmark_variant(base_url, warming, measured, args, selector):
+def benchmark_variant(base_url, warming, measured, args, selector, *, prompt_ids=None):
     """隔离预热和测量时间，避免把上一个阶段未确认的任务带入测量。"""
     sampler = GpuSampler(selector, args.gpu_sample_interval)
     if base_url is None:
@@ -312,10 +329,15 @@ def benchmark_variant(base_url, warming, measured, args, selector):
             jobs, elapsed = run_phase(base_url, measured, args.concurrency, args.timeout, args.poll_interval)
         finally:
             gpu = sampler.stop()
+    if prompt_ids is not None:
+        prompt_ids.update((result.sequence, result.prompt_id) for result in jobs if result.prompt_id is not None)
+    job_rows = [asdict(result) for result in jobs]
+    for row in job_rows:
+        del row["prompt_id"]
     return {
         "warmup": summarize(warmup, warmup_seconds),
         "measured": summarize(jobs, elapsed),
-        "jobs": [asdict(result) for result in jobs],
+        "jobs": job_rows,
         "gpu": gpu,
     }
 
@@ -333,28 +355,254 @@ def endpoint(value):
     raise argparse.ArgumentTypeError("请输入不含凭据、查询或片段的 HTTP(S) 地址")
 
 
+def command_output(command, timeout=30):
+    """以参数列表执行宿主命令，并保留启动失败的诊断信息。"""
+    try:
+        return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"{command[0]} {command[1]}：{error.stderr.strip()}") from error
+
+
+def selected_gpu(selector):
+    """把索引固定为物理卡 UUID，容器分配和显存采样都使用该 UUID。"""
+    row = command_output([
+        "nvidia-smi", f"--id={selector}", "--query-gpu=uuid,name,memory.total,driver_version",
+        "--format=csv,noheader,nounits",
+    ], timeout=3)
+    uuid, name, total, driver = (item.strip() for item in row.split(","))
+    if not re.fullmatch(r"GPU-[a-fA-F0-9-]+", uuid) or "\n" in row:
+        raise ValueError("请选择一张完整的 NVIDIA GPU，使用索引或 GPU UUID")
+    return {"uuid": uuid, "name": name, "total_mib": int(total), "driver_version": driver}
+
+
+def wait_for_idle_gpu(gpu_uuid):
+    """等待前一容器释放 GPU 上下文，有其它计算进程时停止比较。"""
+    deadline = time.monotonic() + 15
+    while True:
+        active = command_output([
+            "nvidia-smi", f"--id={gpu_uuid}", "--query-compute-apps=pid", "--format=csv,noheader,nounits",
+        ], timeout=3)
+        if active in {"", "No running processes found"}:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{gpu_uuid} 仍有计算进程，请使用空闲的 GPU")
+        time.sleep(0.5)
+
+
+def comfy_args_with_probe(arguments):
+    """停用自定义节点时只保留指定节点和同一份计时探针。"""
+    arguments = arguments.copy()
+    if "--disable-all-custom-nodes" not in arguments:
+        return arguments
+    option = "--whitelist-custom-nodes"
+    for index in range(len(arguments) - 1, -1, -1):
+        argument = arguments[index]
+        if argument == option:
+            arguments.insert(index + 1, phase_report.PROBE_FILENAME)
+            return arguments
+        if argument.startswith(option + "="):
+            arguments[index:index + 1] = [option, phase_report.PROBE_FILENAME, argument.partition("=")[2]]
+            return arguments
+    return [*arguments, option, phase_report.PROBE_FILENAME]
+
+
+def docker_run_args(args, image, gpu_uuid, container, variant, *, probe_source=None):
+    """各组共用 GPU、数据和启动参数，双镜像对照另外挂载同一份探针。"""
+    original = variant == "original"
+    profiled = variant in IMAGE_VARIANTS
+    command = ["docker", "run", "--detach", "--name", container, "--pull", "never",
+               "--gpus", f"device={gpu_uuid}", "--publish", "127.0.0.1::8188",
+               "--entrypoint", DOCKER_PYTHON]
+    for name in ("models", "custom_nodes", "input", "extra_model_paths.yaml"):
+        source = args.data_dir / name
+        if source.exists():
+            command.extend(["--volume", f"{source}:/app/{name}:ro"])
+    if original:
+        command.extend(["--volume", f"{args.original_source}:/benchmark/original:ro"])
+    else:
+        mode = "python" if variant == "hybrid_python" else "rust"
+        command.extend(["--env", f"COMFYUI_RS_NATIVE_MODE={mode}", "--env", "COMFYUI_RS_EVICTION_MODE=rust"])
+    if profiled:
+        probe = probe_source or MODEL_PHASE_PROBE.resolve()
+        command.extend([
+            "--volume", f"{probe}:/app/comfyui/custom_nodes/{phase_report.PROBE_FILENAME}:ro",
+            "--env", f"COMFYUI_RS_MODEL_PHASE_PATH={phase_report.PROBE_PATH}",
+        ])
+
+    entry = "/benchmark/original/main.py" if original else "/app/main.py"
+    command.extend([image, entry, "--listen", "0.0.0.0", "--port", "8188",
+                    "--base-directory", "/app", "--disable-assets"])
+    # 混合版从安装根目录自动加载 YAML，原版从挂载的源码目录启动时需显式指定。
+    if original and (args.data_dir / "extra_model_paths.yaml").is_file():
+        command.extend(["--extra-model-paths-config", "/app/extra_model_paths.yaml"])
+    if not args.use_comfy_cache:
+        command.append("--cache-none")
+    command.extend(comfy_args_with_probe(args.comfy_arg) if profiled else args.comfy_arg)
+    return command
+
+
+def wait_for_docker_worker(container, timeout):
+    """等待新实例启动并检查 CUDA 设备，避免把 CPU 回退算进 GPU 对照。"""
+    address = command_output(["docker", "port", container, "8188/tcp"])
+    if not re.fullmatch(r"127\.0\.0\.1:[0-9]+", address):
+        raise RuntimeError(f"{container} 没有独立的本机 API 端口")
+    url = f"http://{address}"
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            stats = request_json(url, "/system_stats", min(2, remaining))
+        except (HttpStatusError, *TRANSPORT_ERRORS):
+            state = command_output(["docker", "inspect", "--format", "{{.State.Status}}", container])
+            if state != "running":
+                raise RuntimeError(f"{container} 启动失败，容器状态为 {state}") from None
+            time.sleep(0.5)
+            continue
+        devices = stats["devices"]
+        if len(devices) != 1 or devices[0]["type"] != "cuda":
+            raise RuntimeError(f"{container} 应使用一张 CUDA GPU")
+        runtime = {key: stats["system"][key] for key in ("comfyui_version", "python_version", "pytorch_version")}
+        return url, runtime
+    raise RuntimeError(f"{container} 在 {timeout:g} 秒内未就绪")
+
+
+def peak_worker_rss_mib(container):
+    """读取 Linux worker 自启动以来的常驻内存峰值，读取失败时保留空值。"""
+    try:
+        status = command_output(["docker", "exec", container, "cat", "/proc/1/status"], timeout=5)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"^VmHWM:[ \t]+([0-9]+)[ \t]+kB$", status, re.MULTILINE)
+    return int(match[1]) / 1024 if match else None
+
+
+def assert_probe_ready(container):
+    """提交任务前验证双镜像都成功启用了同版本的探针。"""
+    try:
+        marker = command_output(["docker", "exec", container, "head", "-n", "1", phase_report.PROBE_PATH], timeout=5)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise RuntimeError("未找到模型计时探针的就绪记录，请检查自定义节点加载设置") from error
+    if not phase_report.probe_ready(marker):
+        raise RuntimeError("模型计时探针的就绪记录不兼容")
+
+
+def read_model_phases(container, jobs, prompt_ids):
+    """在容器清理前读取独立遥测文件，保留读取失败时的其它指标。"""
+    try:
+        raw = command_output(["docker", "exec", container, "cat", phase_report.PROBE_PATH])
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        result = phase_report.summarize_model_phases("", jobs, prompt_ids)
+        result["read_error"] = str(error)
+        return result
+    return phase_report.summarize_model_phases(raw, jobs, prompt_ids)
+
+
+def benchmark_docker(warming, measured, args, gpu, *, probe_source=None):
+    """逐组运行固定镜像 ID 并清理容器，保留已完成组的测量。"""
+    profiled = bool(args.before_image)
+    images = ({"before": args.before_image, "after": args.after_image} if profiled
+              else dict.fromkeys(DOCKER_VARIANTS, args.docker_image))
+    image_ids = {tag: command_output(["docker", "image", "inspect", "--format", "{{.Id}}", tag])
+                 for tag in dict.fromkeys(images.values())}
+    metadata = {"gpu": gpu, "order": list(images), "comfy_args": args.comfy_arg, "data_dir": str(args.data_dir),
+                "cache_none": not args.use_comfy_cache, "runtime": {}}
+    if profiled:
+        metadata["images"] = {variant: {"image": tag, "image_id": image_ids[tag]} for variant, tag in images.items()}
+        probe_source = probe_source or MODEL_PHASE_PROBE.resolve()
+        metadata["model_phase_probe_sha256"] = hashlib.sha256(probe_source.read_bytes()).hexdigest()
+    else:
+        metadata.update(image=args.docker_image, image_id=image_ids[args.docker_image],
+                        original_source=str(args.original_source))
+    reference_runtime = None
+    variants = {}
+    for variant, tag in images.items():
+        try:
+            wait_for_idle_gpu(gpu["uuid"])
+            print(f"开始测量 {variant}，计划执行 {len(warming)} 次预热和 {len(measured)} 次测量。", file=sys.stderr)
+            container = f"comfyui-bench-{uuid4().hex[:12]}-{variant.replace('_', '-')}"
+            try:
+                command = docker_run_args(args, image_ids[tag], gpu["uuid"], container, variant, probe_source=probe_source)
+                command_output(command, timeout=args.startup_timeout)
+                url, runtime = wait_for_docker_worker(container, args.startup_timeout)
+                metadata["runtime"][variant] = runtime
+                if reference_runtime is None:
+                    reference_runtime = runtime
+                if runtime != reference_runtime:
+                    raise RuntimeError("ComfyUI、Python 或 PyTorch 的运行版本不一致")
+                if profiled or variant == "hybrid_rust":
+                    # 多处接入在导入失败时会回退，先确认此镜像的原生扩展可加载。
+                    command_output(["docker", "exec", container, DOCKER_PYTHON, "-c",
+                                    "from comfyui_rs._native import PromptScheduler"])
+                if profiled:
+                    assert_probe_ready(container)
+                    prompt_ids = {}
+                    result = benchmark_variant(url, warming, measured, args, gpu["uuid"], prompt_ids=prompt_ids)
+                    result["model_phases"] = read_model_phases(container, result["jobs"], prompt_ids)
+                else:
+                    result = benchmark_variant(url, warming, measured, args, gpu["uuid"])
+                result["worker_peak_rss_mib"] = peak_worker_rss_mib(container)
+            finally:
+                # 容器由本次脚本创建，未知终态也必须先清理，再开始下一组。
+                try:
+                    command_output(["docker", "rm", "--force", container])
+                except RuntimeError as error:
+                    if "No such container" not in str(error):
+                        raise
+            variants[variant] = result
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            metadata["error"] = f"{variant}：{error}"
+            print(metadata["error"], file=sys.stderr)
+            break
+    return variants, metadata
+
+
 def print_summary(report):
     """用终端表格显示主指标，详细失败与采样信息保留在 JSON 中。"""
-    print("版本       成功/计划   吞吐(成功/s)   P99(s)   显存峰值(MiB)   OOM/已知终态", file=sys.stderr)
+    show_rss = "docker" in report
+    header = "版本            成功/计划   吞吐(成功/s)   P99(s)   显存峰值(MiB)   OOM/已知终态"
+    if show_rss:
+        header += "   worker RAM 峰值(MiB)"
+    print(header, file=sys.stderr)
     for name, variant in report["variants"].items():
         metrics = variant["measured"]
         counts = metrics["status_counts"]
         throughput, p99 = metrics["success_per_second"], metrics["success_p99_seconds"]
         peak, known = variant["gpu"]["peak_mib"], metrics["known_terminal_count"]
         rate = f"{counts.get('oom', 0)}/{known} ({metrics['oom_rate']:.1%})" if known else "—"
-        print(f"{name:<10} {counts.get('success', 0)}/{len(variant['jobs']):<7} "
-              f"{format(throughput, '.3f') if throughput is not None else '—':<14} "
-              f"{format(p99, '.3f') if p99 is not None else '—':<8} "
-              f"{str(peak) if peak is not None else '—':<15} {rate}", file=sys.stderr)
-    if report["settings"]["workflows_without_mutable_seed"] or report["settings"]["keep_seeds"]:
-        print("部分工作流使用固定种子或无可改种子。若要测每次完整执行，两端使用相同的 --cache-none。", file=sys.stderr)
+        row = (f"{name:<15} {counts.get('success', 0)}/{len(variant['jobs']):<7} "
+               f"{format(throughput, '.3f') if throughput is not None else '—':<14} "
+               f"{format(p99, '.3f') if p99 is not None else '—':<8} "
+               f"{str(peak) if peak is not None else '—':<15} {rate}")
+        if show_rss:
+            rss = variant["worker_peak_rss_mib"]
+            row += f"   {format(rss, '.1f') if rss is not None else '—'}"
+        print(row, file=sys.stderr)
+    if (report["settings"]["workflows_without_mutable_seed"] or report["settings"]["keep_seeds"]) and not (
+        report.get("docker", {}).get("cache_none")
+    ):
+        print("部分工作流使用固定种子或无可改种子。若要测每次完整执行，各版本使用相同的 --cache-none。", file=sys.stderr)
     if report["shared_gpu_in_one_run"]:
         print("两个实例记录了同一 GPU。请分别启动并采集，再合并报告，避免模型驻留影响对照。", file=sys.stderr)
     if not report["gpu_metrics_complete"]:
         print("显存采样缺失，报告保留已采集的其它指标。", file=sys.stderr)
+    if "phase_metrics_complete" in report:
+        print("模型阶段             版本           任务数   中位数(ms)   P99(ms)", file=sys.stderr)
+        for variant_name, variant in report["variants"].items():
+            phases = variant["model_phases"]["host_phases"]
+            cuda = variant["model_phases"]["weight_move_cuda"]
+            stage_rows = [(name, stats, "host") for name, stats in phases.items()]
+            stage_rows.append(("weight_move_cuda", cuda, "stream"))
+            for name, stats, metric in stage_rows:
+                middle, p99 = stats[f"median_{metric}_ms"], stats[f"p99_{metric}_ms"]
+                print(f"{name:<20} {variant_name:<14} {stats['jobs']:<8} "
+                      f"{format(middle, '.3f') if middle is not None else '—':<13} "
+                      f"{format(p99, '.3f') if p99 is not None else '—'}", file=sys.stderr)
+            if cuda["partial"]:
+                print(f"{variant_name} 有未完成、超限或失败的 CUDA 事件，流计时仅覆盖已读取的事件。", file=sys.stderr)
+        if not report["phase_metrics_complete"]:
+            print("模型阶段记录不完整，JSON 保留已采集的任务和缺失计数。", file=sys.stderr)
 
 
-def make_report(settings, variants, *, separate_runs=False):
+def make_report(settings, variants, *, separate_runs=False, same_gpu_uuid=None, expected_variants=None):
     """标记任务、采样和设备隔离是否完整，同时保留各自的测量值。"""
     incomplete = any(
         INCOMPLETE.intersection(variant[phase]["status_counts"])
@@ -367,10 +615,15 @@ def make_report(settings, variants, *, separate_runs=False):
     gpu_complete = settings["no_gpu_metrics"] or all(
         variant["gpu"]["peak_mib"] is not None for variant in variants.values()
     )
+    expected = {"original", "hybrid"}
+    if same_gpu_uuid is not None:
+        expected = set(expected_variants or DOCKER_VARIANTS)
+        incomplete = incomplete or set(variants) != expected
+        gpu_complete = gpu_complete and bool(gpu_ids) and all(uuid == same_gpu_uuid for uuid in gpu_ids)
     return {
         "settings": settings,
         "variants": variants,
-        "comparable": len(variants) == 2 and not incomplete and not shared_gpu and gpu_complete,
+        "comparable": set(variants) == expected and not incomplete and not shared_gpu and gpu_complete,
         "incomplete": incomplete,
         "gpu_metrics_complete": gpu_complete,
         "shared_gpu_in_one_run": shared_gpu,
@@ -401,10 +654,20 @@ def save_report(report, output):
 
 
 def main(argv=None):
-    """生成可单独采集或成对比较的基准报告。"""
+    """支持 API 对照、单卡三组对照及双镜像模型阶段压测。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--original-url", type=endpoint, help="原版 ComfyUI API 根地址")
     parser.add_argument("--hybrid-url", type=endpoint, help="Rust 混合版 ComfyUI API 根地址")
+    docker = parser.add_argument_group("单卡 Docker 对照")
+    docker.add_argument("--docker-image", help="本地构建的混合版 CUDA 镜像")
+    docker.add_argument("--before-image", help="采集模型阶段的改前 CUDA 镜像")
+    docker.add_argument("--after-image", help="采集模型阶段的改后 CUDA 镜像")
+    docker.add_argument("--original-source", type=Path, help="同版本的原版 ComfyUI 源码目录")
+    docker.add_argument("--data-dir", type=Path, help="各组共享的数据目录，默认为当前目录")
+    docker.add_argument("--gpu", help="各组复用的物理 GPU 索引或 UUID，默认为 0")
+    docker.add_argument("--startup-timeout", type=float, help="容器启动超时秒数，默认为 120")
+    docker.add_argument("--use-comfy-cache", action="store_true", help="沿用 ComfyUI 的工作流缓存设置")
+    docker.add_argument("--comfy-arg", action="append", default=[], help="传给各组的 ComfyUI 参数，每次指定一个值")
     parser.add_argument("--workflow", type=Path, action="append", help="API 工作流 JSON，可重复指定")
     parser.add_argument("--compare-reports", type=Path, nargs=2, metavar=("ORIGINAL", "HYBRID"),
                         help="离线合并两份分别采集的 JSON 报告")
@@ -421,9 +684,41 @@ def main(argv=None):
     parser.add_argument("--no-gpu-metrics", action="store_true", help="跳过 NVIDIA 显存采样")
     parser.add_argument("--output", type=Path, help="写入 JSON 文件，省略时输出到标准输出")
     args = parser.parse_args(argv)
-    inputs = args.compare_reports or args.workflow or ()
+    profiled = bool(args.before_image or args.after_image)
+    docker_mode = bool(args.docker_image) or profiled
+    if profiled and (not args.before_image or not args.after_image or args.docker_image or args.original_source):
+        parser.error("双镜像阶段压测请同时指定 --before-image 和 --after-image")
+    inputs = list(args.compare_reports or args.workflow or ())
+    if profiled:
+        inputs.append(MODEL_PHASE_PROBE)
     if args.output is not None and any(path.resolve() == args.output.resolve() for path in inputs):
         parser.error("输出文件不能覆盖输入")
+    if docker_mode:
+        if args.original_url or args.hybrid_url or args.compare_reports or args.no_gpu_metrics:
+            parser.error("单卡 Docker 模式需要本地显存采样，并自行管理 API 实例")
+        if profiled:
+            if not MODEL_PHASE_PROBE.is_file():
+                parser.error("缺少 scripts/model_phase_probe.py")
+        else:
+            if args.original_source is None or not (args.original_source / "main.py").is_file():
+                parser.error("请通过 --original-source 指定包含 main.py 的原版 ComfyUI 源码目录")
+            args.original_source = args.original_source.resolve()
+            if (args.original_source / "extra_model_paths.yaml").is_file():
+                parser.error("原版会自动加载源码目录内的 extra_model_paths.yaml，请使用干净的原版源码目录，并把共享配置放在 --data-dir 下")
+        args.data_dir = (args.data_dir or Path.cwd()).resolve()
+        if not args.data_dir.is_dir():
+            parser.error("--data-dir 必须是现有目录")
+        if profiled and any((args.data_dir / "custom_nodes" / name).exists() for name in (
+            phase_report.PROBE_FILENAME, phase_report.PROBE_FILENAME + ".disabled",
+        )):
+            parser.error("数据目录中有同名的模型计时探针，请移开自定义节点目录中的同名文件")
+        args.gpu = args.gpu or "0"
+        args.startup_timeout = 120.0 if args.startup_timeout is None else args.startup_timeout
+        if not math.isfinite(args.startup_timeout) or args.startup_timeout <= 0:
+            parser.error("--startup-timeout 必须是有限的正数")
+    elif any((args.original_source, args.data_dir, args.gpu, args.startup_timeout is not None,
+              args.use_comfy_cache, args.comfy_arg)):
+        parser.error("单卡 Docker 参数需与镜像参数一起使用")
     if args.compare_reports:
         if args.original_url or args.hybrid_url or args.workflow:
             parser.error("合并已有报告时只需要指定两份报告和可选的输出路径")
@@ -439,8 +734,8 @@ def main(argv=None):
             parser.error("无法写入基准报告")
         return 0 if report["comparable"] else 1
 
-    if not (args.original_url or args.hybrid_url):
-        parser.error("至少指定一个 ComfyUI API 地址")
+    if not (args.original_url or args.hybrid_url or docker_mode):
+        parser.error("请指定 ComfyUI API 地址或用于单卡对照的 Docker 镜像")
     if not args.workflow:
         parser.error("请指定至少一份 API 工作流")
     if args.warmups < 0 or args.repeats <= 0 or args.concurrency <= 0:
@@ -471,6 +766,36 @@ def main(argv=None):
         # 节点和输入的字典顺序会影响执行顺序，指纹使用实际提交的顺序。
         digest.update(json.dumps(job.prompt, separators=(",", ":")).encode("utf-8"))
     settings["workload_fingerprint"] = digest.hexdigest()
+
+    if docker_mode:
+        try:
+            with ExitStack() as stack:
+                gpu = selected_gpu(args.gpu)
+                probe = None
+                if profiled:
+                    directory = stack.enter_context(TemporaryDirectory(prefix="comfyui-phase-"))
+                    probe = Path(directory).resolve() / phase_report.PROBE_FILENAME
+                    # 整轮固定探针内容，宿主工作区后续编辑不会改变第二组测量。
+                    probe.write_bytes(MODEL_PHASE_PROBE.read_bytes())
+                    probe.chmod(0o644)
+                variants, metadata = benchmark_docker(warming, measured, args, gpu, probe_source=probe)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            parser.exit(1, f"无法准备单卡对照：{error}\n")
+        report = make_report(settings, variants, separate_runs=True, same_gpu_uuid=gpu["uuid"],
+                             expected_variants=IMAGE_VARIANTS if profiled else DOCKER_VARIANTS)
+        report["docker"] = metadata
+        if profiled:
+            phases = [variant["model_phases"] for variant in variants.values()]
+            same_probe_coverage = len(phases) == 2 and phases[0]["probe"] is not None and phases[0]["probe"] == phases[1]["probe"]
+            complete = same_probe_coverage and all(phase["complete"] for phase in phases)
+            report["phase_probe_coverage_matches"] = same_probe_coverage
+            report["phase_metrics_complete"] = complete
+            report["comparable"] = report["comparable"] and complete
+        try:
+            save_report(report, args.output)
+        except OSError:
+            parser.error("无法写入基准报告")
+        return 0 if report["comparable"] else 1
 
     variants = {}
     outstanding_unknown = False
