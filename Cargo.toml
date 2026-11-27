@@ -1,0 +1,15 @@
+[package]
+name = "comfyui-rs"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "comfyui_rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+python = ["dep:pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.23.5", features = ["abi3-py310"], optional = true }

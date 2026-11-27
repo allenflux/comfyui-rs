@@ -1,0 +1,23 @@
+/target
+/.venv/
+__pycache__/
+
+# 根目录保留 ComfyUI 的数据布局，忽略本地模型、节点和生成文件。
+/models/*
+!/models/*/
+/models/*/*
+!/models/*/put_*_here
+!/models/configs/.gitkeep
+/custom_nodes/*
+!/custom_nodes/.gitkeep
+/input/*
+!/input/example.png
+/output/*
+!/output/_output_images_will_be_put_here
+/user/*
+!/user/.gitkeep
+/previews/*
+!/previews/.gitkeep
+/temp/
+/extra_model_paths.yaml
+/.comfy_environment
