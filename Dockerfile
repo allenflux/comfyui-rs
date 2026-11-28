@@ -32,7 +32,7 @@ RUN python -m venv .venv \
 COPY comfyui/requirements.txt comfyui/requirements.txt
 RUN .venv/bin/python -m pip install -r comfyui/requirements.txt
 
-COPY Cargo.toml Cargo.lock pyproject.toml build.py ./
+COPY Cargo.toml Cargo.lock pyproject.toml build.py torch_backend.py ./
 COPY src/ src/
 COPY python/ python/
 RUN python build.py --no-deps

@@ -7,6 +7,8 @@ import sys
 import venv
 from pathlib import Path
 
+from torch_backend import verify_candle_environment
+
 
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS = ROOT / "comfyui" / "requirements.txt"
@@ -18,9 +20,14 @@ def main():
     parser.add_argument(
         "--venv",
         type=Path,
-        default=ROOT / ".venv",
         metavar="PATH",
-        help="Python 虚拟环境路径，默认为项目目录下的 .venv",
+        help="Python 虚拟环境路径，默认为项目目录下的 .venv 或 .venv-candle",
+    )
+    parser.add_argument(
+        "--torch-backend",
+        choices=("pytorch", "candle"),
+        default="pytorch",
+        help="candle 使用已配置好兼容依赖的环境",
     )
     parser.add_argument(
         "--no-deps",
@@ -31,9 +38,13 @@ def main():
     if not REQUIREMENTS.is_file():
         parser.error(f"找不到随项目提供的依赖文件 {REQUIREMENTS}")
 
-    env_path = args.venv.expanduser().resolve()
+    use_candle = args.torch_backend == "candle"
+    default_env = ROOT / (".venv-candle" if use_candle else ".venv")
+    env_path = (args.venv or default_env).expanduser().resolve()
     python = env_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.is_file():
+        if use_candle:
+            parser.error(f"Candle 后端需要已有的虚拟环境 {env_path}")
         if args.no_deps:
             parser.error("--no-deps 需要已有的 Python 虚拟环境")
         if sys.version_info < (3, 10):
@@ -47,12 +58,14 @@ def main():
     )
     if version_check.returncode != 0:
         parser.error(f"{python} 必须使用 Python 3.10 或更新版本")
+    if use_candle and not verify_candle_environment(python, REQUIREMENTS.parent):
+        parser.exit(1)
 
     pip = [str(python), "-m", "pip"]
     if subprocess.run([*pip, "--version"], capture_output=True).returncode != 0:
         # 一些已有的虚拟环境没有 pip，用该解释器自带的 ensurepip 初始化。
         subprocess.run([str(python), "-m", "ensurepip", "--upgrade"], check=True)
-    if not args.no_deps:
+    if not use_candle and not args.no_deps:
         print("安装 ComfyUI 依赖", flush=True)
         subprocess.run(
             [*pip, "install", "-r", str(REQUIREMENTS)],

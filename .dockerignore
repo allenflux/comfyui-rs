@@ -3,6 +3,7 @@
 .idea
 .vscode
 .venv
+.venv-candle
 target
 .agents
 .aws

@@ -45,6 +45,7 @@ from comfy_execution.validation import LoopValidationError, validate_loops, vali
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
 from comfy_execution.node_monitor import custom_node_source, monitor_node_call
 from comfy_execution.utils import CurrentNodeContext
+from comfy_execution.workflow_memory import WorkflowMemoryPlanner
 from comfy_execution.asset_enrichment import register_executed_outputs, emit_cached_output, take_asset_previews
 from comfy_execution.media_enrichment import enrich_output_with_media_metadata
 from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_real_override, is_class, make_locked_method_func
@@ -468,7 +469,7 @@ def _node_meta(dynprompt, unique_id) -> dict:
     }
 
 
-async def execute(server: "ExecutionServer", dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs, asset_manager: AssetManager):
+async def execute(server: "ExecutionServer", dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs, asset_manager: AssetManager, memory_planner: WorkflowMemoryPlanner | None = None):
     unique_id = current_item
     real_node_id = dynprompt.get_real_node_id(unique_id)
     display_node_id = dynprompt.get_display_node_id(unique_id)
@@ -481,6 +482,8 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
         emit_cached_output(server, unique_id, _node_meta(dynprompt, unique_id), cached, prompt_id, ui_outputs, asset_manager)
         get_progress_state().finish_progress(unique_id)
         execution_list.cache_update(unique_id, cached)
+        if memory_planner is not None:
+            memory_planner.observe_outputs(unique_id, cached.outputs)
         return (ExecutionResult.SUCCESS, None, None)
 
     input_data_all = None
@@ -650,6 +653,8 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
         cache_entry = CacheEntry(ui=cache_ui_value, outputs=output_data)
         execution_list.cache_update(unique_id, cache_entry)
         await caches.outputs.set(unique_id, cache_entry)
+        if memory_planner is not None:
+            memory_planner.observe_outputs(unique_id, output_data)
 
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
@@ -825,6 +830,21 @@ class PromptExecutor:
                 self.add_message("execution_cached",
                               { "nodes": cached_nodes, "prompt_id": prompt_id},
                               broadcast=False)
+                memory_planner = None
+                node_model_loads = {}
+                if args.memory_strategy != "default" and comfy.model_management.model_offload_enabled():
+                    # 上游缓存命中时，加载节点可能不会再次执行，但下游仍会使用缓存中的模型。
+                    # 强制重跑的节点会产生新输出，旧缓存不能作为本次调度的依据。
+                    cached_outputs = {}
+                    for node_id, entry in zip(node_ids, cache_results):
+                        if entry is None or entry.outputs is None:
+                            continue
+                        if args.force_output_rerun:
+                            class_def = nodes.NODE_CLASS_MAPPINGS.get(prompt[node_id]["class_type"])
+                            if class_def is None or _should_force_output_rerun(class_def):
+                                continue
+                        cached_outputs[node_id] = entry.outputs
+                    memory_planner = WorkflowMemoryPlanner(args.memory_strategy, dynamic_prompt, execution_list.pendingNodes, cached_outputs)
                 pending_subgraph_results = {}
                 pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
                 ui_node_outputs = {}
@@ -837,7 +857,16 @@ class PromptExecutor:
                         break
 
                     assert node_id is not None, "Node ID should not be None at this point"
-                    result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs, self.asset_manager)
+                    execute_args = (self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id,
+                                    execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs, self.asset_manager)
+                    if memory_planner is None:
+                        result, error, ex = await execute(*execute_args)
+                    else:
+                        # 节点挂起后，异步任务仍可在原上下文请求模型。
+                        # 同一个节点复用同一集合，直到它的执行结果提交。
+                        used_models = node_model_loads.setdefault(node_id, set())
+                        with comfy.model_management.capture_model_loads(used_models):
+                            result, error, ex = await execute(*execute_args, memory_planner=memory_planner)
                     self.success = result != ExecutionResult.FAILURE
                     if result == ExecutionResult.FAILURE:
                         self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
@@ -846,6 +875,13 @@ class PromptExecutor:
                         execution_list.unstage_node_execution()
                     else: # result == ExecutionResult.SUCCESS:
                         execution_list.complete_node_execution()
+                        if memory_planner is not None:
+                            # 提交成功后，依赖图才移除此节点。还有异步、子图或循环阻塞时只更新使用记录。
+                            memory_planner.after_node(
+                                node_id, execution_list.pendingNodes, node_model_loads.pop(node_id).copy(),
+                                allow_offload=not (pending_async_nodes or pending_subgraph_results or execution_list.externalBlocks),
+                                cached=node_id not in executed,
+                            )
 
                     if self.cache_type == CacheType.RAM_PRESSURE:
                         ram_release_callback(ram_inactive_headroom)

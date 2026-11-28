@@ -1,5 +1,6 @@
 /target
 /.venv/
+/.venv-candle/
 __pycache__/
 
 # 根目录保留 ComfyUI 的数据布局，忽略本地模型、节点和生成文件。

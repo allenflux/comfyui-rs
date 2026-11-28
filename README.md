@@ -25,7 +25,41 @@ python main.py --venv /path/to/venv
 
 `build.py` 使用所选 Python 环境的 pip 配置。已有匹配部署环境的 CUDA 版 PyTorch 时，可以用 `--venv` 直接复用。
 
+### Candle 兼容环境
+
+在单独的虚拟环境中安装 `candle-torch` wheel 和已适配的工作流依赖，再使用 Candle 模式构建和启动。省略 `--venv` 时，Candle 模式使用项目目录下的 `.venv-candle`。
+
+```sh
+python3 build.py --torch-backend candle --venv /path/to/candle-env
+python3 main.py --torch-backend candle --venv /path/to/candle-env --cpu
+```
+
+Candle 模式跳过原版依赖清单，只构建 ComfyUI RS 原生扩展。启动前会检查 `import torch` 是否解析到 `candle-torch` wheel，并拒绝同时安装了原版 PyTorch 的环境。工作流支持范围取决于已安装的兼容包。
+
+用 Candle 环境执行 `scripts/smoke_candle_workflow.py` 可以验证内置图像工作流的 PNG 输出和三步 Euler 采样。测试数据保存在临时目录。
+
 默认数据路径与原版 ComfyUI 同名，位于项目根目录。模型放在 `models/`，自定义节点放在 `custom_nodes/`，输入和输出分别使用 `input/`、`output/`。原来的 `user/` 可以整个复制过来，默认用户的工作流位于 `user/default/workflows/`。将 `extra_model_paths.yaml` 一起复制到根目录后，其中的相对路径仍以该 YAML 所在目录为基准。`--base-directory` 和单独的目录参数仍可显式指定其他位置。
+
+### 工作流显存调度
+
+直接运行 `python main.py` 会使用 `adaptive`。可在启动时显式选择其他策略。
+
+```sh
+python main.py --memory-strategy aggressive
+python main.py --memory-strategy default
+```
+
+| 策略 | 行为 |
+| --- | --- |
+| `adaptive` | 根据当前可用显存、推理预留量和已知后续节点的权重需求决定是否提前回收。`workflow-aware` 是该模式的别名。 |
+| `aggressive` | 模型最后一次使用后，把本次工作流用到的可卸载权重移回 CPU。 |
+| `default` | 沿用 ComfyUI 的显存管理。 |
+
+调度从请求的输出节点反向分析依赖，并用缓存和节点的实际输出识别模型引用。例如，一次工作流有两个提示词编码节点共享同一个 CLIP，`aggressive` 会等两个节点都结束才卸载 CLIP。LoRA 克隆和条件里引用的 ControlNet 也会计入后续使用。异步任务、动态子图或无法判断的依赖尚未解析时，调度会推迟回收。
+
+`adaptive` 按设备估算下游单个节点需要补入的权重，以及推理所需的预留空间。可用空间足够时保留已驻留的权重，便于队列中的下一个任务复用。模型按需加载，实际加载预算和动态分页继续由 ComfyUI 模型管理器处理。
+
+调度只管理 ComfyUI 登记且能卸载到 CPU 的权重。CPU、MPS 共享内存、`--highvram`、`--gpu-only` 和 `--disable-smart-memory` 沿用各自的内存策略。
 
 ## Docker 构建与编译测试
 

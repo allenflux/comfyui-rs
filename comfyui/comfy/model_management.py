@@ -29,6 +29,7 @@ import weakref
 import gc
 import os
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import comfy.memory_management
 import comfy.system_memory
 import comfy.utils
@@ -630,6 +631,7 @@ except:
     pass
 
 current_loaded_models: list[LoadedModel] = []
+_model_load_capture = ContextVar("model_load_capture", default=None)
 
 DIRTY_MMAPS = set()
 
@@ -978,6 +980,16 @@ def _lowvram_load_budget(current_free_mem, loaded_memory, minimum_memory_require
     # 沿用已有的非零标记，避免把预算为零误当成完全加载。
     return 0.1 if budget == 0 else budget
 
+@contextmanager
+def capture_model_loads(models):
+    """把当前节点请求的模型加入调用方的集合，异步子任务继承这个执行上下文。"""
+    token = _model_load_capture.set(models)
+    try:
+        yield
+    finally:
+        _model_load_capture.reset(token)
+
+
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     """复用或加载模型，并根据各设备的可用内存确定权重驻留量。"""
     cleanup_models_gc()
@@ -996,6 +1008,10 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         models_temp[m] = None
         for mm in m.model_patches_models():
             models_temp[mm] = None
+
+    captured_models = _model_load_capture.get()
+    if captured_models is not None:
+        captured_models.update(models_temp)
 
     models = list(models_temp)
     models.reverse()
@@ -1088,6 +1104,50 @@ def loaded_models(only_currently_used=False):
 
         output.append(m.model)
     return output
+
+
+def model_offload_enabled():
+    """判断当前显存模式是否允许主动卸载模型。"""
+    return not DISABLE_SMART_MEMORY and not in_training and vram_state in (VRAMState.NO_VRAM, VRAMState.LOW_VRAM, VRAMState.NORMAL_VRAM)
+
+
+def _offloadable_loaded_models():
+    if not model_offload_enabled():
+        return
+    for loaded in tuple(current_loaded_models):
+        model = loaded.model
+        if model is not None and not is_device_cpu(loaded.device) and is_device_cpu(model.offload_device) and model.loaded_size() > 0:
+            yield loaded, model
+
+
+def offloadable_models():
+    """返回由显存管理器跟踪、可卸载到 CPU 的显存驻留模型。"""
+    return [model for _, model in _offloadable_loaded_models()]
+
+
+def offload_models(models):
+    """用原生卸载路径把指定模型移回 CPU，返回实际卸载的模型数量。"""
+    targets = {id(model) for model in models}
+    if not targets:
+        return 0
+
+    synchronized = set()
+    unloaded = 0
+    for loaded, model in _offloadable_loaded_models():
+        if id(model) not in targets or not any(entry is loaded for entry in current_loaded_models):
+            continue
+        with cuda_device_context(loaded.device):
+            if model.is_dynamic() and loaded.device not in synchronized:
+                # 先等待设备运算完成，再让 AIMDO 释放权重页。
+                synchronize()
+                synchronized.add(loaded.device)
+            loaded.model_unload()
+            # 卸载回调可能更新登记表，只移除本次处理的原记录。
+            current_loaded_models[:] = [entry for entry in current_loaded_models if entry is not loaded]
+        unloaded += 1
+    if unloaded:
+        soft_empty_cache()
+    return unloaded
 
 
 def cleanup_models_gc():
