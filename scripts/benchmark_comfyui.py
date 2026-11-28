@@ -46,7 +46,12 @@ SEED_FIELDS = {
 DOCKER_VARIANTS = ("original", "hybrid_rust", "hybrid_python")
 IMAGE_VARIANTS = ("before", "after")
 POD_VARIANTS = ("rust", "python")
-DOCKER_PYTHON = "/app/.venv/bin/python"
+DOCKER_PYTHON = (
+    "/bin/sh", "-c",
+    'if [ -x /app/.venv-candle/bin/python ]; then exec /app/.venv-candle/bin/python -E -s "$@"; fi\n'
+    'exec /app/.venv/bin/python "$@"',
+    "benchmark-python",
+)
 MODEL_PHASE_PROBE = Path(__file__).with_name("model_phase_probe.py")
 
 
@@ -417,7 +422,7 @@ def docker_run_args(args, image, gpu_uuid, container, variant, *, probe_source=N
     profiled = variant in IMAGE_VARIANTS
     command = ["docker", "run", "--detach", "--name", container, "--pull", "never",
                "--gpus", f"device={gpu_uuid}", "--publish", "127.0.0.1::8188",
-               "--entrypoint", DOCKER_PYTHON]
+               "--entrypoint", DOCKER_PYTHON[0]]
     for name in ("models", "custom_nodes", "input", "extra_model_paths.yaml"):
         source = args.data_dir / name
         if source.exists():
@@ -435,7 +440,7 @@ def docker_run_args(args, image, gpu_uuid, container, variant, *, probe_source=N
         ])
 
     entry = "/benchmark/original/main.py" if original else "/app/main.py"
-    command.extend([image, entry, "--listen", "0.0.0.0", "--port", "8188",
+    command.extend([image, *DOCKER_PYTHON[1:], entry, "--listen", "0.0.0.0", "--port", "8188",
                     "--base-directory", "/app", "--disable-assets"])
     # 混合版从安装根目录自动加载 YAML，原版从挂载的源码目录启动时需显式指定。
     if original and (args.data_dir / "extra_model_paths.yaml").is_file():
@@ -537,10 +542,10 @@ def benchmark_docker(warming, measured, args, gpu, *, probe_source=None):
                 if reference_runtime is None:
                     reference_runtime = runtime
                 if runtime != reference_runtime:
-                    raise RuntimeError("ComfyUI、Python 或 PyTorch 的运行版本不一致")
+                    raise RuntimeError("ComfyUI、Python 或张量后端的运行版本不一致")
                 if profiled or variant == "hybrid_rust":
                     # 多处接入在导入失败时会回退，先确认此镜像的原生扩展可加载。
-                    command_output(["docker", "exec", container, DOCKER_PYTHON, "-c",
+                    command_output(["docker", "exec", container, *DOCKER_PYTHON, "-c",
                                     "from comfyui_rs._native import PromptScheduler"])
                 if profiled:
                     assert_probe_ready(container)
@@ -570,7 +575,7 @@ def pod_worker_command(args, interpreter, directory, port, probe):
     output, user, previews = (directory / name for name in ("output", "user", "previews"))
     for path in (output, user, previews):
         path.mkdir()
-    command = [str(interpreter), str(args.app_dir / "comfyui" / "main.py"), "--disable-assets"]
+    command = [*interpreter, str(args.app_dir / "comfyui" / "main.py"), "--disable-assets"]
     if not args.use_comfy_cache:
         command.append("--cache-none")
     command.extend(comfy_args_with_probe(args.comfy_arg) if probe is not None else args.comfy_arg)
@@ -622,7 +627,7 @@ def stop_pod_worker(worker):
         worker.wait(timeout=5)
 
 
-def run_pod_worker(warming, measured, args, gpu, interpreter, mode, probe):
+def run_pod_worker(warming, measured, args, gpu, interpreter, mode, probe, reference_runtime):
     """在当前镜像启动单个测试 worker，读取阶段数据后清理进程。"""
     if not args.allow_shared_gpu:
         wait_for_idle_gpu(gpu["uuid"])
@@ -646,6 +651,8 @@ def run_pod_worker(warming, measured, args, gpu, interpreter, mode, probe):
                                       start_new_session=True)
             try:
                 runtime = wait_for_pod_worker(worker, url, args.startup_timeout, directory)
+                if reference_runtime is not None and runtime != reference_runtime:
+                    raise RuntimeError("ComfyUI、Python 或张量后端的运行版本不一致")
                 if probe is not None:
                     try:
                         with report_path.open(encoding="utf-8") as probe_report:
@@ -712,13 +719,16 @@ def summarize_pod_pairs(rounds):
 def benchmark_pod(settings, warming, measured, args):
     """在一个 Pod 内交替两种模式，保留已完成的轮次与部分结果。"""
     gpu = selected_gpu(args.gpu)
-    interpreter = args.app_dir / ".venv" / "bin" / "python"
-    if not interpreter.is_file():
-        interpreter = Path(sys.executable)
-    command_output([str(interpreter), "-c", "from comfyui_rs._native import PromptScheduler"])
+    candle_python = args.app_dir / ".venv-candle" / "bin" / "python"
+    legacy_python = args.app_dir / ".venv" / "bin" / "python"
+    if candle_python.is_file():
+        interpreter = (str(candle_python), "-E", "-s")
+    else:
+        interpreter = (str(legacy_python) if legacy_python.is_file() else sys.executable,)
+    command_output([*interpreter, "-c", "from comfyui_rs._native import PromptScheduler"])
     probe = None if args.no_phase_probe else MODEL_PHASE_PROBE.read_bytes()
     metadata = {"gpu": gpu, "app_dir": str(args.app_dir), "data_dir": str(args.data_dir),
-                "python": str(interpreter), "comfy_args": args.comfy_arg, "cache_none": not args.use_comfy_cache,
+                "python": interpreter[0], "comfy_args": args.comfy_arg, "cache_none": not args.use_comfy_cache,
                 "allow_shared_gpu": args.allow_shared_gpu, "planned_rounds": args.rounds,
                 "model_phase_probe_sha256": hashlib.sha256(probe).hexdigest() if probe is not None else None}
     rounds = []
@@ -729,12 +739,10 @@ def benchmark_pod(settings, warming, measured, args):
         for mode in order:
             try:
                 print(f"第 {index + 1}/{args.rounds} 轮，开始测量 {mode}。", file=sys.stderr)
-                result, runtime = run_pod_worker(warming, measured, args, gpu, interpreter, mode, probe)
+                result, runtime = run_pod_worker(warming, measured, args, gpu, interpreter, mode, probe, reference_runtime)
                 if reference_runtime is None:
                     reference_runtime = runtime
                     metadata["runtime"] = runtime
-                if runtime != reference_runtime:
-                    raise RuntimeError("ComfyUI、Python 或 PyTorch 的运行版本不一致")
                 variants[mode] = result
             except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
                 metadata["error"] = f"第 {index + 1} 轮 {mode}：{error}"

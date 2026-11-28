@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import subprocess
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -81,11 +82,12 @@ class FakeDockerComfyUI(FakeComfyUI):
     variants = ("original", "hybrid_rust", "hybrid_python")
     hosts = ("http://original.test", "http://hybrid.test", "http://hybrid-python.test")
 
-    def __init__(self, cpu_fallback=None):
+    def __init__(self, cpu_fallback=None, different_backend=None):
         """记录启动和清理事件，允许指定一组模拟 CPU 回退。"""
         super().__init__()
         self.payloads = {host: [] for host in self.hosts}
         self.cpu_fallback = cpu_fallback
+        self.different_backend = different_backend
         self.container = None
         self.commands = []
         self.launches = []
@@ -125,9 +127,11 @@ class FakeDockerComfyUI(FakeComfyUI):
         assert base_url == f"http://127.0.0.1:{21000 + len(self.launches)}"
         index = len(self.launches) - 1
         if route == "/system_stats":
-            device_type = "cpu" if self.variants[index] == self.cpu_fallback else "cuda"
+            variant = self.variants[index]
+            device_type = "cpu" if variant == self.cpu_fallback else "cuda"
+            backend_version = "different" if variant == self.different_backend else "test"
             return {"system": {"comfyui_version": "test", "python_version": "test",
-                               "pytorch_version": "test"}, "devices": [{"type": device_type}]}
+                               "pytorch_version": backend_version}, "devices": [{"type": device_type}]}
         return super().request(self.hosts[index], route, timeout, payload)
 
 
@@ -342,6 +346,21 @@ class BenchmarkTests(unittest.TestCase):
 
 
 class DockerBenchmarkTests(unittest.TestCase):
+    @unittest.skipUnless(Path("/bin/sh").is_file(), "requires a POSIX shell")
+    def test_docker_python_prefers_candle_and_uses_legacy_in_historical_image(self):
+        with TemporaryDirectory() as folder:
+            app = Path(folder)
+            shell, flag, select, name = benchmark.DOCKER_PYTHON
+            cmd = [shell, flag, select.replace("/app/", f"{app}/"), name, "entry with spaces", "--port", "8188"]
+            arguments = cmd[-3:]
+            for environment, expected in ((".venv", arguments), (".venv-candle", ["-E", "-s", *arguments])):
+                python = app / environment / "bin" / "python"
+                python.parent.mkdir(parents=True)
+                python.write_text("#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\"\n", encoding="utf-8")
+                python.chmod(0o755)
+                output = subprocess.check_output(cmd, text=True)
+                self.assertEqual(output.splitlines(), [str(python), *expected])
+
     def run_benchmark(self, fake):
         """用两个工作流完整执行 CLI，拦截 Docker、HTTP 和显存采样。"""
         with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
@@ -397,10 +416,14 @@ class DockerBenchmarkTests(unittest.TestCase):
         self.assertIn("/app/extra_model_paths.yaml", original)
         self.assertIn("COMFYUI_RS_NATIVE_MODE=rust", rust)
         self.assertIn("COMFYUI_RS_NATIVE_MODE=python", python)
-        checks = [command for command in fake.commands if command[:2] == ["docker", "exec"] and command[3] == benchmark.DOCKER_PYTHON]
+        checks = [command for command in fake.commands if command[:2] == ["docker", "exec"]
+                  and tuple(command[3:7]) == benchmark.DOCKER_PYTHON]
         self.assertEqual([command[2] for command in checks], [rust[rust.index("--name") + 1]])
         for command in fake.launches:
             self.assertIn(fake.image_id, command)
+            self.assertEqual(command[command.index("--entrypoint") + 1], benchmark.DOCKER_PYTHON[0])
+            image = command.index(fake.image_id)
+            self.assertEqual(tuple(command[image + 1:image + 4]), benchmark.DOCKER_PYTHON[1:])
             self.assertIn(f"device={fake.gpu_uuid}", command)
             self.assertIn(f"{report['docker']['data_dir']}/models:/app/models:ro", command)
             self.assertIn("--cache-none", command)
@@ -419,6 +442,15 @@ class DockerBenchmarkTests(unittest.TestCase):
         self.assertEqual(fake.removed, [command[command.index("--name") + 1] for command in fake.launches])
         self.assertIsNone(fake.container)
         self.assertIn("hybrid_rust", report["docker"]["error"])
+
+    def test_rejects_backend_version_mismatch_before_submitting_work(self):
+        fake = FakeDockerComfyUI(different_backend="hybrid_rust")
+        code, report, _selectors = self.run_benchmark(fake)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["comparable"])
+        self.assertIn("张量后端的运行版本不一致", report["docker"]["error"])
+        self.assertEqual(fake.payloads[fake.hosts[1]], [])
+        self.assertIsNone(fake.container)
 
 
 class FakeModelPhaseDocker(FakeDockerComfyUI):
@@ -561,9 +593,10 @@ class FakePodComfyUI(FakeComfyUI):
     gpu_uuid = FakeDockerComfyUI.gpu_uuid
     port = 21000
 
-    def __init__(self, fail_start=None):
+    def __init__(self, fail_start=None, different_backend=None):
         super().__init__()
         self.fail_start = fail_start
+        self.different_backend = different_backend
         self.launches = []
         self.stopped = []
         self.process = None
@@ -578,7 +611,7 @@ class FakePodComfyUI(FakeComfyUI):
                 return ""
             assert "--id=2" in command
             return f"{self.gpu_uuid}, NVIDIA Test GPU, 32768, 595.58"
-        assert command[1:] == ["-c", "from comfyui_rs._native import PromptScheduler"]
+        assert command[-2:] == ["-c", "from comfyui_rs._native import PromptScheduler"]
         return ""
 
     def launch(self, command, *, cwd, env, start_new_session, **_options):
@@ -608,8 +641,9 @@ class FakePodComfyUI(FakeComfyUI):
         command, _cwd, env = self.launches[-1]
         if route == "/system_stats":
             kind = "cpu" if self.fail_start == index else "cuda"
+            backend_version = "different" if self.different_backend == index else "test"
             return {"system": {"argv": command, "comfyui_version": "test", "python_version": "test",
-                               "pytorch_version": "test"}, "devices": [{"type": kind}]}
+                               "pytorch_version": backend_version}, "devices": [{"type": kind}]}
         result = super().request(f"http://worker-{index}.test", route, timeout, payload)
         path = env.get("COMFYUI_RS_MODEL_PHASE_PATH")
         if path is not None and route == "/prompt" and payload is not None:
@@ -624,12 +658,16 @@ class FakePodComfyUI(FakeComfyUI):
 
 
 class PodNativeBenchmarkTests(unittest.TestCase):
-    def run_benchmark(self, fake, *extra_args):
+    def run_benchmark(self, fake, *extra_args, environments=()):
         """从 CLI 跑完整 Pod 路径，替换 GPU、进程和 HTTP。"""
         with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
             app = Path(directory).resolve()
             (app / "comfyui").mkdir()
             (app / "comfyui" / "main.py").touch()
+            for environment in environments:
+                python = app / environment / "bin" / "python"
+                python.parent.mkdir(parents=True)
+                python.touch()
             first, second, output = [app / f"{name}.json" for name in ("a", "b", "report")]
             first.write_text(json.dumps(workflow(11)), encoding="utf-8")
             second.write_text(json.dumps(workflow(22, "RandomNoise", "noise_seed")), encoding="utf-8")
@@ -655,9 +693,11 @@ class PodNativeBenchmarkTests(unittest.TestCase):
     def test_default_rounds_reverse_order_and_reuse_workload_without_probe(self):
         """无探针模式复用唯一 GPU、种子和工作流，两轮交换顺序。"""
         fake = FakePodComfyUI()
-        code, report, selectors = self.run_benchmark(fake, "--no-phase-probe")
+        code, report, selectors = self.run_benchmark(fake, "--no-phase-probe", environments=(".venv",))
         self.assertEqual(code, 0)
         self.assertTrue(report["comparable"])
+        self.assertTrue(all(command[0] == str(cwd / ".venv" / "bin" / "python")
+                            for command, cwd, _env in fake.launches))
         self.assertEqual([row["order"] for row in report["rounds"]], [["rust", "python"], ["python", "rust"]])
         self.assertEqual([env["COMFYUI_RS_NATIVE_MODE"] for _, _, env in fake.launches], ["rust", "python", "python", "rust"])
         self.assertEqual([env["CUDA_VISIBLE_DEVICES"] for _, _, env in fake.launches], [fake.gpu_uuid] * 4)
@@ -695,6 +735,16 @@ class PodNativeBenchmarkTests(unittest.TestCase):
         self.assertIn("python", report["pod"]["error"])
         self.assertEqual(len(report["rounds"]), 1)
         self.assertEqual(list(report["rounds"][0]["variants"]), ["rust"])
+
+    def test_prefers_candle_and_rejects_mismatched_pod_backend_before_work(self):
+        fake = FakePodComfyUI(different_backend=2)
+        code, report, _selectors = self.run_benchmark(fake, "--no-phase-probe", environments=(".venv", ".venv-candle"))
+        self.assertEqual(code, 1)
+        self.assertFalse(report["comparable"])
+        self.assertIn("张量后端的运行版本不一致", report["pod"]["error"])
+        self.assertEqual(fake.payloads["http://worker-2.test"], [])
+        for command, cwd, _env in fake.launches:
+            self.assertEqual(command[:3], [str(cwd / ".venv-candle" / "bin" / "python"), "-E", "-s"])
 
 
 if __name__ == "__main__":

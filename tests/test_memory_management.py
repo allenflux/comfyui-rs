@@ -123,7 +123,10 @@ class MemoryManagementTests(unittest.TestCase):
         tensor = torch.arange(6, dtype=torch.int16).reshape(2, 3)
         gathered = torch.zeros(15 * 1024 + 12, dtype=torch.uint8)
         gathered[15 * 1024:].view(torch.int16).fill_(5)
-        compiled = torch.compile(add_layout_metadata, backend="eager", fullgraph=True)
+        try:
+            compiled = torch.compile(add_layout_metadata, backend="eager", fullgraph=True)
+        except NotImplementedError as error:
+            self.skipTest(str(error))
         torch.testing.assert_close(compiled(tensor, gathered), tensor + 1035, rtol=0, atol=0)
 
     def test_gathered_views_accept_last_slice_without_trailing_padding(self):
@@ -178,6 +181,8 @@ class MemoryManagementTests(unittest.TestCase):
     def test_quantized_cat_keeps_layout_and_storage_aliases(self):
         """量化数据和元数据各自对齐，原地合并后的布局能再次解析。"""
         torch = self.torch
+        if not hasattr(torch.Tensor, "_make_wrapper_subclass"):
+            self.skipTest("comfy-kitchen 量化包装需要 Tensor._make_wrapper_subclass")
         weights = [
             self.memory.QuantizedTensor.from_float(
                 torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8),

@@ -1,10 +1,10 @@
+-c requirements-candle-constraints.txt
+
 comfyui-frontend-package==1.59.15
 comfyui-workflow-templates==0.11.118
 comfyui-embedded-docs==0.5.17
-torch
-torchsde
-torchvision
-numpy>=1.25.0
+candle-torch>=0.1.0
+numpy>=2.0
 einops
 transformers>=4.50.3
 tokenizers>=0.13.3
@@ -14,7 +14,7 @@ aiohttp>=3.11.8
 yarl>=1.18.0
 pyyaml
 Pillow>=10.1.0
-scipy
+scipy>=1.11
 tqdm
 psutil
 alembic
@@ -27,9 +27,12 @@ requests
 simpleeval>=1.0.0
 blake3
 
+# Runtime dependencies of requirements-candle-compat.txt.
+trampoline>=0.1.2
+kornia-rs>=0.2.0
+typing_extensions
+
 #non essential dependencies:
-kornia>=0.7.1
-spandrel
 pydantic~=2.0
 pydantic-settings~=2.0
 PyOpenGL>=3.1.8

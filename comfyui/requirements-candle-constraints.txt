@@ -1,0 +1,5 @@
+# Keep candle-torch as the provider of the torch, torchvision and candle namespaces.
+torch==0,!=0
+torchvision==0,!=0
+torchaudio==0,!=0
+candle-nn==0,!=0

@@ -347,7 +347,7 @@ if cgroup_ram_limit is not None:
     logging.info("RAM limited by cgroup to {:0.0f} MB (host has {:0.0f} MB)".format(cgroup_ram_limit / (1024 * 1024), psutil.virtual_memory().total / (1024 * 1024)))
 
 try:
-    logging.info("pytorch version: {}".format(torch_version))
+    logging.info("%s version: %s", "candle-torch" if getattr(torch, "__candle_torch__", False) else "pytorch", torch_version)
     mac_ver = mac_version()
     if mac_ver is not None:
         logging.info("Mac Version {}".format(mac_ver))

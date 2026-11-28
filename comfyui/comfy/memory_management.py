@@ -220,7 +220,9 @@ def _gathered_view(template, gathered, start, end):
     """按原始字节数检查范围并恢复张量形状，末尾填充不占视图范围。"""
     if end > gathered.numel():
         raise ValueError(f"Buffer too small: needs {end} bytes, but only has {gathered.numel()}. ")
-    return gathered[start:end].view(dtype=template.dtype).view(template.shape)
+    if getattr(torch, "__candle_torch__", False) and (gathered.storage_offset() + start) % template.element_size():
+        raise RuntimeError(f"Buffer offset must be aligned to the size of {template.dtype}")
+    return gathered[start:end].view(template.dtype).view(template.shape)
 
 
 def interpret_gathered_like(tensors, gathered):

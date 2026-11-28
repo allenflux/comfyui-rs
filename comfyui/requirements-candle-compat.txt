@@ -1,0 +1,4 @@
+# Install with --no-deps. candle-torch supplies their torch and torchvision imports.
+torchsde==0.2.6
+kornia==0.9.2
+spandrel==0.4.2

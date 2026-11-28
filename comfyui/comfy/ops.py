@@ -457,7 +457,8 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     bias = None
     weight = None
 
-    if offload_stream is not None and not args.cuda_malloc:
+    # Candle accelerator tensors cannot reinterpret the packed byte buffer as weights.
+    if offload_stream is not None and not args.cuda_malloc and not getattr(torch, "__candle_torch__", False):
         cast_buffer_size = comfy.memory_management.vram_aligned_size([ s.weight, s.bias ])
         cast_buffer = comfy.model_management.get_cast_buffer(offload_stream, device, cast_buffer_size, s)
         #The streams can be uneven in buffer capability and reject us. Retry to get the other stream
