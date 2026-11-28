@@ -43,6 +43,7 @@ from comfy_execution.graph import (
 from comfy_execution.graph_utils import GraphBuilder, is_link
 from comfy_execution.validation import LoopValidationError, validate_loops, validate_node_input
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
+from comfy_execution.node_monitor import custom_node_source, monitor_node_call
 from comfy_execution.utils import CurrentNodeContext
 from comfy_execution.asset_enrichment import register_executed_outputs, emit_cached_output, take_asset_previews
 from comfy_execution.media_enrichment import enrich_output_with_media_metadata
@@ -251,6 +252,8 @@ async def resolve_map_node_over_list_results(results):
         return [x.result() if isinstance(x, asyncio.Task) else x for x in results]
 
 async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, func, allow_interrupt=False, execution_block_cb=None, pre_execute_cb=None, v3_data=None):
+    """执行节点的批量调用，在实际进入第三方函数时记录各次调用。"""
+    source = custom_node_source(obj)
     # check if node wants the lists
     input_is_list = getattr(obj, "INPUT_IS_LIST", False)
 
@@ -301,7 +304,11 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 f = getattr(obj, func)
             if inspect.iscoroutinefunction(f):
                 async def async_wrapper(f, prompt_id, unique_id, list_index, args):
+                    """等待异步节点完成，让监控窗口覆盖挂起时间。"""
                     with CurrentNodeContext(prompt_id, unique_id, list_index):
+                        if source is not None:
+                            with monitor_node_call(source, prompt_id, unique_id, list_index, func):
+                                return await f(**args)
                         return await f(**args)
                 task = asyncio.create_task(async_wrapper(f, prompt_id, unique_id, index, args=inputs))
                 # Give the task a chance to execute without yielding
@@ -313,7 +320,11 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                     results.append(task)
             else:
                 with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                    if source is None:
+                        result = f(**inputs)
+                    else:
+                        with monitor_node_call(source, prompt_id, unique_id, index, func):
+                            result = f(**inputs)
                 results.append(result)
         else:
             results.append(execution_block)
@@ -519,7 +530,13 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
 
             obj = await caches.objects.get(unique_id)
             if obj is None:
-                obj = class_def()
+                # 有些节点在构造阶段加载模型或分配内存，单独记录首次实例化。
+                source = custom_node_source(class_def)
+                if source is None:
+                    obj = class_def()
+                else:
+                    with monitor_node_call(source, prompt_id, unique_id, None, "__init__"):
+                        obj = class_def()
                 await caches.objects.set(unique_id, obj)
 
             if issubclass(class_def, _ComfyNodeInternal):

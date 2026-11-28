@@ -216,6 +216,29 @@ COMFYUI_RS_OBSERVE=1 python main.py
 
 如果要在日志中附加预算判断，设置 `COMFYUI_RS_EXPECTED_EXTRA_BYTES` 为预计新增显存字节数，并通过 `COMFYUI_RS_HEADROOM_BYTES` 设置安全余量，默认为 `0`。预算判断只用于观测。
 
+## 定位自定义节点 OOM
+
+使用正常的 `python main.py` 启动即可。自定义节点监控默认开启，工作流和第三方节点沿用原有入口。Pod 中在应用日志里搜索 `comfyui_rs_node `，前缀后面是 JSON。用 `prompt_id` 找到工作流，再用 `node_id`、`node_class` 和 `pack` 定位节点。单次调用用 `call_id` 关联，`function` 和 `list_index` 可以区分节点方法及列表中的各次调用。
+
+监控也会把每条记录追加到 `user/node-monitor/` 下按 worker 命名的 JSONL 文件。用 `--user-directory` 启动时，该目录随用户目录移动。可在启动时设置 `COMFYUI_RS_NODE_MONITOR_LOG_DIR` 指向已有持久卷上的可写目录，以便 Pod 重启后仍能取回日志。每个 worker 的文件默认按 8 MiB 轮转，保留 4 份历史文件。实际能回看的时长由节点调用量决定。
+
+链路跑完后，可以在 Pod shell 打包当前日志目录。
+
+```sh
+node_log_dir="${COMFYUI_RS_NODE_MONITOR_LOG_DIR:-/app/user/node-monitor}"
+tar -czf "/tmp/comfyui-node-monitor-$(date +%Y%m%d-%H%M%S).tgz" -C "$node_log_dir" .
+```
+
+| 事件 | 如何阅读 |
+| --- | --- |
+| `start` | 节点开始时的内存快照。 |
+| `sample` | 节点执行期间的进程内存采样。进程约每 250 ms 采样，长时间执行的节点约每 2 秒记录一次。 |
+| `finish` | 调用耗时、结果、采样次数、观测峰值及结束快照。捕获到的内存不足会带上 OOM 类型。 |
+
+内存快照记录 worker 的 RSS、估算有效可用 RAM，以及可读取时的 cgroup 限额。设备支持时，还会记录 PyTorch 分配器按设备统计的分配量和保留量。采样观察的是进程和设备计数，异步节点并行执行时可能同时推高计数，采样也可能错过短于间隔的峰值。日志只包含节点标识、状态和测量数据，输入、输出和异常正文无需写入节点监控记录。
+
+如果 Pod 的终止状态显示 `OOMKilled`，从前一次 worker 的日志里用 `worker_run_id` 和 `call_id` 找到已有 `start` 或 `sample` 的未完成调用，并可按 `timestamp_ms` 恢复顺序。这些调用是排查线索。监控仅采集数据，任务失败继续由 ComfyUI 原有逻辑处理。
+
 ## 本地验证
 
 ```sh
